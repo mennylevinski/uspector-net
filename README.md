@@ -67,7 +67,7 @@ Source: https://github.com/giampaolo/psutil/tree/master?tab=BSD-3-Clause-1-ov-fi
 #### 1️ Requirements
 - Python **3.0+**
 - Works on **Windows**, **Linux**
-- No external packages required
+- Requires: `pip install psutil`
 
 #### 2️ Script
 - Download the script [lite_net_scanner.py](script/lite_net_scanner.py)
