@@ -341,35 +341,64 @@ def discover_hosts(subnet: ipaddress.IPv4Network, max_workers: int = 100, tcp_po
 
     return alive_ips
 
-def discover_network(subnet, local_ip, do_port_scan=False, fast=False, ports=None):
+def discover_network(subnet, local_ip=None, do_port_scan=False, fast=False, ports=None):
     """
-    Scan the subnet for alive devices, MACs, hostnames, and optionally open ports.
-    Filters out ghost IPs on Windows using ARP table.
+    Discover hosts on a subnet. Works for Ethernet and Wi-Fi.
+    - Uses TCP ports + ICMP ping fallback.
+    - Pre-populates ARP table to detect devices that block ping/TCP.
     """
+
     if ports is None:
         ports = COMMON_PORTS
 
     if subnet is None and local_ip:
         subnet = guess_subnet(local_ip, 24)
 
+    port_timeout = 0.4 if fast else 1.2
+    tcp_timeout = 0.10 if fast else 0.3
+
     if not subnet:
         logging.warning("No subnet provided, skipping scan.")
         return []
 
-    port_timeout = 0.4 if fast else 1.2
-    tcp_timeout = 0.10 if fast else 0.3
+    # ---- Step 0: Pre-populate ARP cache ----
+    ips = [str(ip) for ip in subnet.hosts()]
+    logging.info(f"Pre-pinging {len(ips)} IPs to populate ARP cache...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=200) as ex:
+        list(ex.map(lambda ip: _ping(ip, timeout_ms=300), ips))
 
-    # ---- Step 1: Detect alive hosts ----
-    alive_ips = discover_hosts(subnet, max_workers=200, tcp_ports=ports, timeout=tcp_timeout)
+    # ---- Step 1: Parallel ping + TCP sweep ----
+    def _fast_alive(ip):
+        # TCP check first
+        for port in [22, 53, 139, 161, 443, 445]:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(tcp_timeout)
+                    if s.connect_ex((ip, port)) == 0:
+                        return ip
+            except:
+                pass
+        # Fallback to ICMP ping
+        if _ping(ip, timeout_ms=400):
+            return ip
+        return None
 
-    # ---- Step 2: Remove local IP from results ----
+    alive_ips = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=400) as ex:
+        for result in ex.map(_fast_alive, ips):
+            if result:
+                alive_ips.append(result)
+
+    # ---- Step 2: Skip local IP ----
     if local_ip and local_ip in alive_ips:
         alive_ips.remove(local_ip)
 
-    # ---- Step 3: Get MAC addresses from ARP ----
+    # ---- Step 3: Parse ARP table for MACs ----
     ip_mac = _parse_arp_table()
 
     devices = []
+
+    # ---- Step 4: Scan open ports (if enabled) and resolve hostnames ----
     with concurrent.futures.ThreadPoolExecutor(max_workers=100) as ex:
         port_futures = {}
         for ip in alive_ips:
@@ -394,7 +423,27 @@ def discover_network(subnet, local_ip, do_port_scan=False, fast=False, ports=Non
                 "open_ports": open_ports
             })
 
-    # ---- Step 4: Sort devices by IP ----
+    # ---- Step 5: Include devices found only in ARP (ping-blocked) ----
+    for ip, mac in ip_mac.items():
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+            if ip_obj == subnet.broadcast_address:
+                continue
+            if (ip_obj in subnet
+                and ip_obj.is_private
+                and ip_obj not in [ipaddress.ip_address(x["ip"]) for x in devices]
+                and mac.lower() != "ff:ff:ff:ff:ff:ff"):
+                devices.append({
+                    "ip": ip,
+                    "hostname": "N/A",
+                    "mac": mac,
+                    "alive": True,
+                    "open_ports": []
+                })
+        except ValueError:
+            continue
+
+    # ---- Step 6: Sort by IP ----
     return sorted(devices, key=lambda x: socket.inet_aton(x["ip"]))
 
 def _highlight_risky_ports(ports: Iterable[int]) -> List[str]:
