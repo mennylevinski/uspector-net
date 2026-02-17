@@ -497,7 +497,7 @@ def test_print(
 
     devices = discover_network(
         subnet=subnet,
-        local_ip=local,
+        local_ip=local_ip,
         do_port_scan=do_port_scan,
         fast=fast,
         ports=ports
@@ -723,7 +723,7 @@ while True:
         try:
             for ip in target_ips:
                 # 0 Skip local IP
-                if ip == local_ip:
+                if local and ip == local:
                     logging.info(f"\n[SKIP] {ip} is local — skipping.")
                     continue
                 # 1 Only scan private IPs
