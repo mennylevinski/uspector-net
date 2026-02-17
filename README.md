@@ -43,7 +43,7 @@ If you trust this application, you may need to add it as an exception in your an
 
 ### Windows EXE
 
-Download the latest [Lite_Net_Scanner_1.0.0.zip](https://github.com/mennylevinski/network_scanner/releases/download/1.0.0/Lite_Net_Scanner_1.0.0.zip). Unzip and double-click the executable to run.
+Download the latest [Lite_Net_Scanner_1.1.0.zip](https://github.com/mennylevinski/network_scanner/releases/download/1.1.0/Lite_Net_Scanner_1.1.0.zip). Unzip and double-click the executable to run.
 
 No Python installation is required when using the EXE.
 
@@ -53,8 +53,12 @@ If Microsoft Defender SmartScreen appears:
 
 ### Third Party License
 Python Software Foundation License Version 2  
-Copyright © 2001-2025 Python Software Foundation.  
+Copyright © 2001-2025 Python Software Foundation <br>
 Source: https://docs.python.org/license.html
+
+psutil BSD 3-Clause License <br>
+Copyright © 2009-2025 Giampaolo Rodola <br>
+Source: https://github.com/giampaolo/psutil/tree/master?tab=BSD-3-Clause-1-ov-file
 
 ---
 
