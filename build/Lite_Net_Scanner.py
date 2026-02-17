@@ -16,11 +16,12 @@ import subprocess
 import concurrent.futures
 import threading
 import itertools
+import psutil
 from typing import List, Dict, Iterable, Optional
 from io import StringIO
 from typing import Optional
 
-version = "1.0.0"
+version = "1.1.0"
 
 log_buffer = io.StringIO()
 now = datetime.datetime.now().replace(microsecond=0)
@@ -150,40 +151,54 @@ def _run_subprocess_run(cmd, shell=False, **kwargs) -> subprocess.CompletedProce
     base_kwargs.update(kwargs)
     return subprocess.run(cmd, **base_kwargs)
 
-def _local_ip() -> Optional[str]:
+def _get_default_interface_and_ip() -> (Optional[str], Optional[str]):
+    """
+    Detect the real default network adapter and its IPv4 address.
+    Uses routing table via psutil (already imported).
+    """
+
     try:
+        gws = psutil.net_if_stats()
+        addrs = psutil.net_if_addrs()
+
+        # Get default gateway using socket trick (most reliable cross-platform)
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(0.5)
         s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
+        local_ip = s.getsockname()[0]
         s.close()
-        return ip
+
+        # Now find which interface owns this IP
+        for iface, addr_list in addrs.items():
+            for addr in addr_list:
+                if addr.family == socket.AF_INET and addr.address == local_ip:
+                    return iface, local_ip
+
     except Exception:
-        return None
+        pass
+
+    return None, None
 
 def guess_subnet(ip: Optional[str], mask_bits: int = 24) -> ipaddress.IPv4Network:
     if not ip:
         return ipaddress.ip_network("0.0.0.0/0")
     return ipaddress.ip_network(f"{ip}/{mask_bits}", strict=False)
 
-def _ping(ip: str, timeout_ms: int = 100, rate: int = 50) -> bool:
+def _ping(ip: str, timeout_ms: int = 300) -> bool:
+    system = platform.system().lower()
 
-    try:
-        if IS_WINDOWS:
-            cmd = ["ping", "-n", "1", "-w", str(timeout_ms), ip]
-            proc = _run_subprocess_run(cmd, shell=False)
-        else:
-            timeout_s = max(1, int((timeout_ms + 999) // 1000))
-            cmd = ["ping", "-c", "1", "-W", str(timeout_s), ip]
-            proc = _run_subprocess_run(cmd, shell=False)
+    if system == "windows":
+        cmd = ["ping", "-n", "1", "-w", str(timeout_ms), ip]
+    else:
+        # Linux / macOS
+        timeout_sec = max(1, timeout_ms // 1000)
+        cmd = ["ping", "-c", "1", "-W", str(timeout_sec), ip]
 
-        # throttle ping frequency
-        if rate > 0:
-            time.sleep(1 / rate)
-
-        return proc.returncode == 0
-    except Exception:
-        return False
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    return result.returncode == 0
 
 def _parse_arp_table() -> Dict[str, str]:
     ip_to_mac = {}
@@ -283,15 +298,22 @@ def _scan_ports(ip: str, ports: Iterable[int], timeout: float = 0.12, max_worker
 
     return sorted(open_ports)
 
-def discover_hosts(subnet: ipaddress.IPv4Network, max_workers: int = 400, tcp_ports=None, timeout: float = 0.1) -> List[str]:
+def discover_hosts(subnet: ipaddress.IPv4Network, max_workers: int = 100, tcp_ports=None, timeout: float = 0.1) -> List[str]:
+    """
+    Detect alive hosts in the subnet using TCP ports first, then optional ping fallback.
+    Returns list of IPs that respond and (on Windows) have a MAC in ARP table.
+    """
     if tcp_ports is None:
-        tcp_ports = [22, 53, 139, 161, 443, 445]  # common ports for alive detection
+        tcp_ports = [22, 53, 80, 139, 443, 445, 3389]
 
     ips = [str(ip) for ip in subnet.hosts()]
     if not ips:
         return []
 
-    def _fast_alive(ip):
+    ip_mac = _parse_arp_table()  # prefetch ARP once
+
+    def _check_ip(ip):
+        # 1️⃣ TCP check
         for port in tcp_ports:
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -300,37 +322,51 @@ def discover_hosts(subnet: ipaddress.IPv4Network, max_workers: int = 400, tcp_po
                         return ip
             except:
                 continue
+
+        # 2️⃣ Ping fallback only for small subnets (<50 hosts)
+        if len(ips) <= 50 and _ping(ip, timeout_ms=300):
+            return ip
+
         return None
 
+    alive_ips = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers, len(ips))) as ex:
-        results = list(ex.map(_fast_alive, ips))
+        for ip in ex.map(_check_ip, ips):
+            if ip:
+                alive_ips.append(ip)
 
-    alive = [ip for ip in results if ip]
-    return sorted(alive, key=lambda x: socket.inet_aton(x))
+    # ---- Windows-only: filter out IPs without a MAC in ARP table ----
+    if IS_WINDOWS:
+        alive_ips = [ip for ip in alive_ips if ip_mac.get(ip)]
 
-def discover_network(subnet: Optional[ipaddress.IPv4Network] = None,
-                     ports: Optional[Iterable[int]] = None,
-                     do_port_scan: bool = True,
-                     fast: bool = True) -> List[Dict]:
+    return alive_ips
 
+def discover_network(subnet, local_ip, do_port_scan=False, fast=False, ports=None):
+    """
+    Scan the subnet for alive devices, MACs, hostnames, and optionally open ports.
+    Filters out ghost IPs on Windows using ARP table.
+    """
     if ports is None:
         ports = COMMON_PORTS
 
-    local_ip = _local_ip()  # Detect local IP
-    if subnet is None:
+    if subnet is None and local_ip:
         subnet = guess_subnet(local_ip, 24)
 
+    if not subnet:
+        logging.warning("No subnet provided, skipping scan.")
+        return []
+
     port_timeout = 0.4 if fast else 1.2
-    tcp_timeout = 0.10 if fast else 0.3  # for fast host detection
+    tcp_timeout = 0.10 if fast else 0.3
 
-    # Discover alive hosts using TCP connect (much faster than ping)
-    alive_ips = discover_hosts(subnet, max_workers=400, timeout=tcp_timeout)
+    # ---- Step 1: Detect alive hosts ----
+    alive_ips = discover_hosts(subnet, max_workers=200, tcp_ports=ports, timeout=tcp_timeout)
 
-    # --- Skip local IP ---
-    if local_ip in alive_ips:
+    # ---- Step 2: Remove local IP from results ----
+    if local_ip and local_ip in alive_ips:
         alive_ips.remove(local_ip)
 
-    # Get ARP table for MAC addresses
+    # ---- Step 3: Get MAC addresses from ARP ----
     ip_mac = _parse_arp_table()
 
     devices = []
@@ -341,7 +377,7 @@ def discover_network(subnet: Optional[ipaddress.IPv4Network] = None,
                 port_futures[ip] = ex.submit(_scan_ports, ip, ports, port_timeout, 200)
 
         for ip in alive_ips:
-            hostname = "N/A" if fast else _resolve_hostname(ip, timeout=1.0)
+            hostname = _resolve_hostname(ip, timeout=1.0) if not fast else "N/A"
             mac = ip_mac.get(ip)
             open_ports = []
             if do_port_scan and ip in port_futures:
@@ -358,7 +394,8 @@ def discover_network(subnet: Optional[ipaddress.IPv4Network] = None,
                 "open_ports": open_ports
             })
 
-    return devices
+    # ---- Step 4: Sort devices by IP ----
+    return sorted(devices, key=lambda x: socket.inet_aton(x["ip"]))
 
 def _highlight_risky_ports(ports: Iterable[int]) -> List[str]:
     mapping = {}
@@ -399,16 +436,23 @@ def _primary_mac() -> Optional[str]:
 # ======= Print Setup =======
 def test_print(
     subnet: Optional[ipaddress.IPv4Network] = None,
+    local_ip: Optional[str] = None,
     do_port_scan: bool = True,
     fast: bool = True,
     ports: Optional[Iterable[int]] = None,
     silent: bool = False,
 ) -> list:
-    if subnet is None:
-        local = _local_ip()
-        subnet = guess_subnet(local, 24)
 
-    devices = discover_network(subnet=subnet, do_port_scan=do_port_scan, fast=fast, ports=ports)
+    if subnet is None and local_ip:
+        subnet = guess_subnet(local_ip, 24)
+
+    devices = discover_network(
+        subnet=subnet,
+        local_ip=local,
+        do_port_scan=do_port_scan,
+        fast=fast,
+        ports=ports
+    )
 
     if silent:
         return devices
@@ -513,18 +557,24 @@ if __name__ == "__main__":
 
     # --- Detect local IP and subnet ---
     print(f"MIT License – © 2025 Menny Levinski\n")
-    interface = _first_interface()
-    logging.info(f"Interface: {interface or 'N/A'}")
+    interface, local = _get_default_interface_and_ip()
     mac = _primary_mac()
-    logging.info(f"Local MAC: {mac or 'N/A'}")
-    local = _local_ip()
-    logging.info(f"Local IP: {local or 'N/A'}")
+    logging.info(f"Interface: {interface or 'N/A'}")
+    logging.info(f"Local MAC: {mac or 'N/A'}")   
+    logging.info(f"Local Adapter IP: {local or 'N/A'}")
 
-    if local and ":" not in local:
+    # ---- ADD THIS LOGIC HERE ----
+    if isinstance(local, str) and local.startswith("169.254."):
+        logging.warning("APIPA detected (169.254.x.x). No DHCP lease — LAN scan disabled.")
+        subnet = None
+
+    elif isinstance(local, str) and "." in local:
         subnet = guess_subnet(local, 24)
         logging.info(f"Guessed subnet: {subnet}")
+
     else:
         logging.warning("Subnet guessing skipped (IPv6 or no IP)")
+        subnet = None
 
     # --- Initialize target_ips variable ---
     target_ips = None
@@ -570,7 +620,12 @@ while True:
         spinner.start()
         start = time.time()
         try:
-            results = test_print(subnet=subnet, do_port_scan=True, fast=True)
+            results = test_print(
+                subnet=subnet,
+                local_ip=local,
+                do_port_scan=True,
+                fast=True
+            )
             scan_results.extend(results)
         finally:
             spinner.stop()
@@ -578,7 +633,6 @@ while True:
             logging.info(f"LAN scan finished in {elapsed:.1f}s")
 
     elif scan_mode == "2":
-        local_ip = _local_ip()
         print("\nCustom scan options:")
         print("Format options:")
         print(" - Single IP (example: 1.1.1.1)")
@@ -636,10 +690,12 @@ while True:
                 try:
                     results = test_print(
                         subnet=single_subnet,
+                        local_ip=local,
                         do_port_scan=True,
                         fast=True,
                         silent=True
                     )
+
                 except Exception as e:
                     logging.error(f"[ERROR] Scan failed for {ip}: {e}")
                     continue
@@ -664,8 +720,13 @@ while True:
 
     export = input("\nExport logs to text file? (Y to export, Enter to skip): ").strip().lower()
     if export == "y":
-        export_path = "scan_log_export.txt"
+        # Generate timestamp for filename
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        export_path = f"scan_log_export_{timestamp}.txt"
+        
+        # Write log buffer to file
         with open(export_path, "w", encoding="utf-8") as f:
             f.write(log_buffer.getvalue())
+        
         print(f"Logs exported → {export_path}")
         continue
