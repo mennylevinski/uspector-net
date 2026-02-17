@@ -31,4 +31,4 @@ Source: https://docs.python.org/license.html
 
 psutil BSD 3-Clause License
 Copyright © 2009-2025 Giampaolo Rodola  
-https://github.com/giampaolo/psutil/tree/master?tab=BSD-3-Clause-1-ov-file
+Source: https://github.com/giampaolo/psutil/tree/master?tab=BSD-3-Clause-1-ov-file
