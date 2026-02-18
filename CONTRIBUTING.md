@@ -86,7 +86,7 @@ This tool is designed for **defensive diagnostics**, not exploitation.
 
 ## 🔀 How to Submit a Contribution
 
-1. **Fork** the repository
+1. Fork the repository
 2. Make your changes
 3. Test on at least one supported OS
 4. Commit with a clear message
