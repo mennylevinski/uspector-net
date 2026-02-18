@@ -7,6 +7,28 @@ Licensed under the [MIT License](LICENSE).
 
 ---
 
+## 🏗 Project Build
+
+```bash
+main/
+│
+├── build/                # Compiled EXE output (PyInstaller)
+│
+├── media/                # Images, diagrams, UI assets
+│
+├── script/               # Cross-platform version file
+│
+├── CHANGELOG.md          # Version history
+├── CONTRIBUTING.md       # Contribution guidelines
+├── LICENSE               # Project license
+├── README.md             # Main documentation
+├── SECURITY.md           # Security policy
+└── .gitignore
+
+```
+
+---
+
 ## ✨ Features
 
 - **LAN Detection Mode**, detects your IPv4 subnet and scans the local network
