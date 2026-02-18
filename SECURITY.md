@@ -26,7 +26,7 @@ If you discover a security vulnerability, please report it responsibly.
 Please report security issues by:
 
 * Opening a **private security advisory** on GitHub (preferred), or
-* Contacting the project maintainer directly (if contact details are provided in the repository)
+* Contacting the project maintainer directly: menny.levinski@secuditor.com
 
 When reporting, include as much detail as possible:
 
