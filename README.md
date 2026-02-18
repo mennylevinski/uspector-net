@@ -80,7 +80,7 @@ Source: https://github.com/giampaolo/psutil/tree/master?tab=BSD-3-Clause-1-ov-fi
 
 ---
 
-## 🏗 Project Structure
+## 📁 Project Structure
 
 ```bash
 network_scanner/
@@ -98,7 +98,3 @@ network_scanner/
 ├── SECURITY.md           # Security policy
 └── .gitignore
 ```
-
----
-
-### made by Menny Levinski
