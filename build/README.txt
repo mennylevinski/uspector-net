@@ -1,6 +1,6 @@
 Lite Network Scanner
 MIT License – © 2025 Menny Levinski
-https://github.com/mennylevinski/network_scanner?tab=MIT-1-ov-file
+https://github.com/mennylevinski/network-scanner?tab=MIT-1-ov-file
 
 ---
 
