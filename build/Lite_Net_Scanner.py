@@ -21,7 +21,7 @@ from typing import List, Dict, Iterable, Optional
 from io import StringIO
 from typing import Optional
 
-version = "1.1.0"
+version = "1.2.0"
 
 log_buffer = io.StringIO()
 now = datetime.datetime.now().replace(microsecond=0)
@@ -354,8 +354,8 @@ def discover_network(subnet, local_ip=None, do_port_scan=False, fast=False, port
     if subnet is None and local_ip:
         subnet = guess_subnet(local_ip, 24)
 
-    port_timeout = 0.4 if fast else 1.2
-    tcp_timeout = 0.10 if fast else 0.3
+    port_timeout = 0.6
+    tcp_timeout = 0.3
 
     if not subnet:
         logging.warning("No subnet provided, skipping scan.")
@@ -369,22 +369,24 @@ def discover_network(subnet, local_ip=None, do_port_scan=False, fast=False, port
 
     # ---- Step 1: Parallel ping + TCP sweep ----
     def _fast_alive(ip):
-        # TCP check first
-        for port in [22, 53, 139, 161, 443, 445]:
+        tcp_hits = 0
+        tcp_ports = [22, 53, 139, 161, 443, 445]
+
+        for port in tcp_ports:
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(tcp_timeout)
+                    s.settimeout(0.3)  # tcp_timeout
                     if s.connect_ex((ip, port)) == 0:
-                        return ip
+                        tcp_hits += 1
             except:
                 pass
-        # Fallback to ICMP ping
-        if _ping(ip, timeout_ms=400):
+
+        if tcp_hits >= 1:
             return ip
-        return None
 
     alive_ips = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=400) as ex:
+    max_threads = min(128, len(ips))  # 128 is aggressive but safe
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as ex:
         for result in ex.map(_fast_alive, ips):
             if result:
                 alive_ips.append(result)
@@ -423,23 +425,37 @@ def discover_network(subnet, local_ip=None, do_port_scan=False, fast=False, port
                 "open_ports": open_ports
             })
 
-    # ---- Step 5: Include devices found only in ARP (ping-blocked) ----
+    # ---- Step 5: Include ARP-only hosts (TCP-blocked / firewalled) ----
+    existing_ips = {d["ip"] for d in devices}
+
     for ip, mac in ip_mac.items():
         try:
             ip_obj = ipaddress.ip_address(ip)
-            if ip_obj == subnet.broadcast_address:
+
+            # Must be inside scanned subnet
+            if ip_obj not in subnet:
                 continue
-            if (ip_obj in subnet
-                and ip_obj.is_private
-                and ip_obj not in [ipaddress.ip_address(x["ip"]) for x in devices]
-                and mac.lower() != "ff:ff:ff:ff:ff:ff"):
-                devices.append({
-                    "ip": ip,
-                    "hostname": "N/A",
-                    "mac": mac,
-                    "alive": True,
-                    "open_ports": []
-                })
+
+            # Skip broadcast address
+            if ip == str(subnet.broadcast_address):
+                continue
+
+            # Skip already-detected TCP hosts
+            if ip in existing_ips:
+                continue
+
+            # Skip invalid MACs
+            if not mac or mac.lower().startswith("ff-ff"):
+                continue
+
+            devices.append({
+                "ip": ip,
+                "hostname": "N/A",
+                "mac": mac,
+                "alive": False,  # TCP didn’t respond
+                "open_ports": []
+            })
+
         except ValueError:
             continue
 
