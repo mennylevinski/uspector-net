@@ -73,10 +73,10 @@ Source: https://github.com/giampaolo/psutil/tree/master?tab=BSD-3-Clause-1-ov-fi
 - Download the script [uspector_net.py](uspector_net.py)
 
 #### 3️⃣ Run
-- Windows: `python uspector-net.py`
+- Windows: `python uspector_net.py`
 - Linux:<br> 
-      1. `chmod +x uspector-net.py` <br>
-      2. `python3 uspector-net.py`
+      1. `chmod +x uspector_net.py` <br>
+      2. `python3 uspector_net.py`
 
 ---
 
@@ -94,6 +94,6 @@ uspector-net/
 ├── LICENSE               # Project license
 ├── README.md             # Main documentation
 ├── SECURITY.md           # Security policy
-├── uspector-net.py       # Cross-platform version file
+├── uspector_net.py       # Cross-platform version file
 └── .gitignore
 ```
