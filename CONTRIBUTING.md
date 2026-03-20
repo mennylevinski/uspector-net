@@ -1,6 +1,6 @@
 # Contributing to Lite Network Scanner
 
-Thank you for your interest in contributing to **Lite Network Scanner**, Contributions of all kinds are welcome, code, documentation, testing, ideas, and feedback.
+Thank you for your interest in contributing to **Uspector Network Scanner**, Contributions of all kinds are welcome, code, documentation, testing, ideas, and feedback.
 
 This project is an **open-source, cross-platform Python tool** designed for ethical network diagnostics, security awareness, and administrative auditing.
 
@@ -119,6 +119,6 @@ By contributing, you agree that your contributions will be licensed under the sa
 
 ## 🙏 Thank You
 
-Every contribution, small or large, helps improve **Lite Network Scanner**.
+Every contribution, small or large, helps improve **Uspector Network Scanner**.
 
 Thank you for supporting ethical, defensive, and responsible network diagnostics.
