@@ -56,7 +56,7 @@ def setup_logger(level=logging.INFO, logfile: Optional[str] = None):
     logging.basicConfig(level=level, handlers=handlers)
 
 # ======= Console helper =======
-def ensure_console(title: str = "Lite Network Scanner"):
+def ensure_console(title: str = "Uspector Network Scanner"):
     """Ensure a console is available on Windows with black background / white text."""
     if sys.platform.startswith("win"):
         try:
@@ -615,7 +615,7 @@ def is_private_ip(ip: str) -> bool:
 
 # ======= Main =======
 if __name__ == "__main__":
-    ensure_console(f"Uspector {version}")
+    ensure_console(f"Uspector Network Scanner {version}")
 
     log_level = logging.DEBUG if "--debug" in sys.argv else logging.INFO
     log_file = None
