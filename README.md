@@ -18,7 +18,7 @@ Licensed under the [MIT License](LICENSE).
 
 <br>
 
-![App Screenshot](media/netscanner_screenshot.png)
+![Uspector Screenshot](media/uspector_screenshot.png)
 
 ---
 
