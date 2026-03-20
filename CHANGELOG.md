@@ -1,6 +1,16 @@
 # Changelog
 
-## [1.2.0] – 2026-02-23 – Latest
+## [1.3.0] – 2026-03-20 Latest
+### Added
+- Name changed to "Uspector Network Scanner"
+- More common ports added to the scanning list (43 total)
+
+### Fixed
+- Adjusted default worker threads for better stability
+
+---
+
+## [1.2.0] – 2026-02-23 – 
 
 ### Added
 - Essential stability optimizations for LAN detection mode
