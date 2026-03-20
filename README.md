@@ -70,7 +70,7 @@ Source: https://github.com/giampaolo/psutil/tree/master?tab=BSD-3-Clause-1-ov-fi
 - Requires: `pip install psutil`
 
 #### 2️ Script
-- Download the script [lite_net_scanner.py](uspector-net.py)
+- Download the script [uspector-net.py](uspector-net.py)
 
 #### 3️⃣ Run
 - Windows: `python uspector-net.py`
