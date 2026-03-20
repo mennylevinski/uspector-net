@@ -1,4 +1,4 @@
-# Uspector – Lite Network Scanner
+# Uspector – Network Scanner
 
 Cross-platform Python tool designed to discover devices on your local IPv4 network.
 Built for ethical diagnostics, security awareness, and administrative auditing. Suitable for personal and organizational use.
@@ -83,7 +83,7 @@ Source: https://github.com/giampaolo/psutil/tree/master?tab=BSD-3-Clause-1-ov-fi
 ## 📁 Project Structure
 
 ```bash
-network-scanner/
+uspector-net/
 │
 ├── build/                # Ingredients for EXE (PyInstaller)
 │
