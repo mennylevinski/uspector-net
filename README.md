@@ -70,7 +70,7 @@ Source: https://github.com/giampaolo/psutil/tree/master?tab=BSD-3-Clause-1-ov-fi
 - Requires: `pip install psutil`
 
 #### 2️ Script
-- Download the script [uspector_net.py](cross_platform/uspector_net.py)
+- Download the script [uspector_net.py](src/uspector_net.py)
 
 #### 3️⃣ Run
 - Windows: `python uspector_net.py`
@@ -85,11 +85,11 @@ Source: https://github.com/giampaolo/psutil/tree/master?tab=BSD-3-Clause-1-ov-fi
 ```bash
 uspector-net/
 │
-├── build_windows/        # Ingredients for EXE (PyInstaller)
+├── build/                # Ingredients for EXE (PyInstaller)
 │
-├── cross_platform/       # Cross-platform version file
+├── src/                  # Cross-platform version file
 │
-├── media_files/          # Images, diagrams, UI assets
+├── media/                # Images, diagrams, UI assets
 │
 ├── CHANGELOG.md          # Version history
 ├── CONTRIBUTING.md       # Contribution guidelines
