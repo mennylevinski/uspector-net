@@ -18,7 +18,7 @@ Licensed under the [MIT License](LICENSE).
 
 <br>
 
-![Uspector Screenshot](media_files/uspector_screenshot.png)
+![Uspector Screenshot](media/uspector_screenshot.png)
 
 ---
 
