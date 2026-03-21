@@ -85,11 +85,11 @@ Source: https://github.com/giampaolo/psutil/tree/master?tab=BSD-3-Clause-1-ov-fi
 ```bash
 uspector-net/
 │
-├── build/                # Ingredients for EXE (PyInstaller)
+├── build/                # PyInstaller configs / EXE build
 │
 ├── media/                # Images, diagrams, UI assets
 │
-├── src/                  # Source file used for cross-platform
+├── src/                  # Core application source code
 │
 ├── CHANGELOG.md          # Version history
 ├── CONTRIBUTING.md       # Contribution guidelines
