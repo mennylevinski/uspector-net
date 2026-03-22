@@ -615,7 +615,7 @@ def is_private_ip(ip: str) -> bool:
 
 # ======= Main =======
 if __name__ == "__main__":
-    ensure_console(f"Uspector Network Scanner {version}")
+    ensure_console(f"Uspector Network Scanner")
 
     log_level = logging.DEBUG if "--debug" in sys.argv else logging.INFO
     log_file = None
