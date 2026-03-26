@@ -3,6 +3,8 @@
 Uspector is a cross-platform Python tool designed to discover devices and detect open ports on your local IPv4 network.
 Built for ethical diagnostics, security awareness, and administrative auditing. Suitable for both personal and organizational use.
 
+For a detailed list of all common ports scanned by Uspector, see [PORTS.md](PORTS.md).
+
 Licensed under the [MIT License](LICENSE).
 
 ---
