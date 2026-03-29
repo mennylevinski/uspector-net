@@ -1,6 +1,6 @@
 <div align="center" style="line-height: 0;">
     <a href="https://github.com/mennylevinski/uspector-net">
-        <img src="media/uspector-main-logo.png" alt="Uspector Logo" width="300" height="250">
+        <img src="media/uspector-main-logo.png" alt="Uspector Logo" width="200" height="200">
     </a>
 </div>
 
