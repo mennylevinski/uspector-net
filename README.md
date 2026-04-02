@@ -49,9 +49,9 @@ If you trust this application, you may need to add it as an exception in your an
 
 ## 💾 Installation
 
-### Windows EXE
+### 💻 Windows EXE
 
-Download the latest [Uspector_1.3.0.zip](https://github.com/mennylevinski/uspector-net/releases/download/1.3.0/Uspector_1.3.0.zip). Unzip and double-click the executable to run.
+Download the latest [release](https://github.com/mennylevinski/uspector-net/releases). Unzip and double-click the executable to run.
 
 No Python installation is required when using the EXE.
 
@@ -68,9 +68,7 @@ psutil BSD 3-Clause License <br>
 Copyright © 2009-2025 Giampaolo Rodola <br>
 Source: https://github.com/giampaolo/psutil/tree/master?tab=BSD-3-Clause-1-ov-file
 
----
-
-### Cross-platform
+### 🐍 Cross-platform
 
 #### 1️ Requirements
 - Python **3.0+**
