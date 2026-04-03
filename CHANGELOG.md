@@ -1,6 +1,8 @@
 # Changelog
 All notable changes to **Uspector Network Scanner** are documented in this file.
 
+---
+
 ## [1.3.0] – 2026-03-20 Latest
 ### Added
 - Name changed to "Uspector Network Scanner"
