@@ -22,7 +22,7 @@ Licensed under the [MIT License](LICENSE).
 - **Logging system**, exportable log file (TXT format) for more detailed output
 - **Terminal / CLI**, clean “black console” output, stays open after completion
 
-For a detailed list of all common ports scanned by Uspector, see [PORTS.md](PORTS.md).
+For a detailed list of all common ports scanned by Uspector, see [PORTS.md](PORTS.md)
 
 <br>
 
