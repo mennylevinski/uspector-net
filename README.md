@@ -9,8 +9,6 @@
 Uspector is a lightweight, cross-platform Python network scanner that enables device discovery and open port detection across local IPv4 networks, including Wi-Fi and Ethernet.
 Built for ethical diagnostics, security awareness, and administrative auditing, it is suitable for both personal and organizational use.
 
-For a detailed list of all common ports scanned by Uspector, see [PORTS.md](PORTS.md).
-
 Licensed under the [MIT License](LICENSE).
 
 ---
@@ -23,6 +21,8 @@ Licensed under the [MIT License](LICENSE).
 - **Port Detection**, scans common service ports (FTP, SMB, SSH, RDP, and more)
 - **Logging system**, exportable log file (TXT format) for more detailed output
 - **Terminal / CLI**, clean “black console” output, stays open after completion
+
+For a detailed list of all common ports scanned by Uspector, see [PORTS.md](PORTS.md).
 
 <br>
 
@@ -51,13 +51,15 @@ If you trust this application, you may need to add it as an exception in your an
 
 ### 💻 Windows EXE
 
-Download the latest [release](https://github.com/mennylevinski/uspector-net/releases). Unzip and double-click the executable to run.
+Download the latest **[release](https://github.com/mennylevinski/uspector-net/releases)**. Extract the archive, then double-click the executable to run.
 
-No Python installation is required when using the EXE.
+> No Python installation required (portable executable)
 
 If Microsoft Defender SmartScreen appears:
 - Click More info
 - Click Run anyway
+
+---
 
 ### 🐍 Cross-platform
 
