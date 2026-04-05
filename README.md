@@ -21,7 +21,7 @@ Licensed under the [MIT License](LICENSE).
 - **Port Detection**, scans common service ports (FTP, SMB, SSH, RDP, and more)
 - **Logging system**, exportable log file (TXT format) for more detailed output
 - **Terminal / CLI**, clean “black console” output, stays open after completion
-- **Basic Traffic Inspection** module, real-time monitoring of active TCP connections (Beta)
+- **Basic Traffic Inspection** module, real-time monitoring of active TCP connections
 
 For a detailed list of all common ports scanned by Uspector, see [PORTS.md](PORTS.md)
 
