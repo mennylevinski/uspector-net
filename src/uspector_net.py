@@ -29,7 +29,7 @@ from typing import List, Dict, Iterable, Optional
 from io import StringIO
 from typing import Optional
 
-version = "1.3.0"
+version = "1.4.0"
 
 log_buffer = io.StringIO()
 now = datetime.datetime.now().replace(microsecond=0)
@@ -506,6 +506,125 @@ def _primary_mac() -> Optional[str]:
     except Exception:
         return None
 
+# ======= Connection Inspector (Controlled) =======
+
+COMMON_PORTS_SET = set(COMMON_PORTS)
+
+def _get_process_name(pid):
+    try:
+        return psutil.Process(pid).name()
+    except Exception:
+        return "N/A"
+
+def _detect_direction(laddr_ip: str, raddr_ip: str, local_subnet: Optional[ipaddress.IPv4Network] = None) -> str:
+    """
+    Detects if connection is IN (incoming) or OUT (outgoing)
+    - laddr_ip = local IP
+    - raddr_ip = remote IP
+    - local_subnet = optional, for strict LAN check
+    Returns: 'IN', 'OUT', or 'LAN'
+    """
+    try:
+        l_ip = ipaddress.ip_address(laddr_ip)
+        r_ip = ipaddress.ip_address(raddr_ip)
+
+        if local_subnet:
+            if r_ip in local_subnet:
+                return "LAN"
+            elif l_ip in local_subnet:
+                return "OUT"
+            else:
+                return "IN"
+
+        # Fallback using is_private
+        if r_ip.is_private:
+            return "LAN"
+        elif l_ip.is_private:
+            return "OUT"
+        else:
+            return "IN"
+
+    except ValueError:
+        return "OUT"  # default fallback
+
+def start_connection_inspector(
+    interval: float = 1.0,
+    ports: Optional[List[int]] = None,
+    timeout: int = 0,
+    skip_time_wait: bool = True
+):
+    """
+    Inspect active TCP connections every `interval` seconds.
+    Logs new connections for specified ports (default COMMON_PORTS) in clean flow.
+    skip_time_wait: if True, ignores TIME_WAIT connections.
+    timeout: max runtime in seconds (0 = unlimited)
+    """
+    stop_event = threading.Event()
+    ports_set = set(ports) if ports else COMMON_PORTS_SET
+    seen = set()  # store already logged connections
+
+    # Detect local IP once
+    local_iface, local_ip = _get_default_interface_and_ip()
+    if not local_ip:
+        local_ip = "0.0.0.0"  # fallback
+    local_subnet = guess_subnet(local_ip, 24)
+
+    def _inspector():
+        logging.info(f"=== Connection Inspector started (ports: {ports if ports else 'ALL'}) ===")
+        start_time = time.time()
+
+        while not stop_event.is_set():
+            now = time.time()
+            try:
+                for conn in psutil.net_connections(kind='inet'):
+                    if not conn.laddr or not conn.raddr:
+                        continue
+
+                    lport, rport = conn.laddr.port, conn.raddr.port
+
+                    # Only selected ports
+                    if ports_set and lport not in ports_set and rport not in ports_set:
+                        continue
+
+                    # Skip TIME_WAIT if requested
+                    if skip_time_wait and conn.status == "TIME_WAIT":
+                        continue
+
+                    key = (conn.pid, conn.laddr.ip, lport, conn.raddr.ip, rport, conn.status)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    pid = conn.pid or "N/A"
+                    proc_name = _get_process_name(conn.pid)
+                    src_ip, dst_ip = conn.laddr.ip, conn.raddr.ip
+
+                    # FIXED: Detect direction correctly
+                    direction = _detect_direction(src_ip, dst_ip, local_subnet=local_subnet)
+
+                    logging.info(f"[FLOW] {direction} {proc_name} {src_ip}:{lport} → {dst_ip}:{rport} ({conn.status})")
+
+                # Clean up memory occasionally
+                if len(seen) > 5000:
+                    seen.clear()
+
+            except Exception as e:
+                logging.debug(f"[Inspector Error] {e}")
+
+            # Timeout
+            if timeout > 0 and (now - start_time) >= timeout:
+                logging.info("Traffic inspection timeout reached.")
+                stop_event.set()
+                break
+
+            time.sleep(interval)
+
+        logging.info("=== Traffic inspection stopped ===")
+
+    thread = threading.Thread(target=_inspector, daemon=True)
+    thread.start()
+    return stop_event, thread
+
 # ======= Print Setup =======
 def test_print(
     subnet: Optional[ipaddress.IPv4Network] = None,
@@ -632,7 +751,7 @@ if __name__ == "__main__":
     print(f"MIT License – © 2025 Menny Levinski\n")
     interface, local = _get_default_interface_and_ip()
     mac = _primary_mac()
-    logging.info(f"App version {version}\n")
+    logging.info(f"Uspector version {version}\n")
     logging.info(f"Interface: {interface or 'N/A'}")
     logging.info(f"Local MAC: {mac or 'N/A'}")   
     logging.info(f"Local Adapter IP: {local or 'N/A'}")
@@ -673,10 +792,11 @@ while True:
     print("\nSelect scan type:")
     print("1. LAN scanning")
     print("2. Custom IP range")
-    print("3. Exit")
-    scan_mode = input("\nEnter choice (1-3): ").strip()
+    print("3. Traffic Inspection")
+    print("4. Exit")
+    scan_mode = input("\nEnter choice (1-4): ").strip()
 
-    if scan_mode not in {"1", "2", "3"}:
+    if scan_mode not in {"1", "2", "3", "4"}:
         print("Invalid choice!")
         continue
 
@@ -789,6 +909,45 @@ while True:
                 print(f"Custom scan finished in {elapsed:.1f}s - No devices found.")
 
     elif scan_mode == "3":
+        # --- Ask for timeout ---
+        try:
+            timeout = int(input("\nSelect timeout (10-300 seconds, 0 = unlimited): ").strip())
+            if timeout < 0 or timeout > 300:
+                print("Invalid timeout, using default 0 (unlimited).")
+                timeout = 0
+        except ValueError:
+            print("Invalid timeout, using default 0 (unlimited).")
+            timeout = 0
+
+        # --- Ask for ports ---
+        raw_ports = input(f"\nType which ports to inspect (for example: 80, 443) or press Enter (COMMON_PORTS): ").strip()
+        if raw_ports:
+            try:
+                ports_to_monitor = [int(p.strip()) for p in raw_ports.split(",") if p.strip()]
+            except ValueError:
+                print("Invalid port list, falling back to COMMON_PORTS")
+                ports_to_monitor = COMMON_PORTS
+        else:
+            ports_to_monitor = COMMON_PORTS
+
+        choice = input("\nStart traffic inspection? (Y/N): ").strip().upper()
+        if choice != "Y":
+            print("Traffic inspection cancelled.")
+            continue
+
+        stop_event, thread = start_connection_inspector(interval=2, ports=ports_to_monitor)
+
+        try:
+            print("\nTraffic inspection running... Press ENTER to stop or Ctrl+C")
+            input()  # Wait for ENTER or Ctrl+C
+        except KeyboardInterrupt:
+            print("\nStopping due to keyboard interrupt...")
+        finally:
+            stop_event.set()
+            thread.join()
+            logging.info("Traffic inspection stopped.")
+        
+    elif scan_mode == "4":
         input("\nGoodby! Press Enter to exit...")
         sys.exit(0)
 
