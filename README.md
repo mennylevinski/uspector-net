@@ -27,7 +27,9 @@ For a detailed list of all common ports scanned by Uspector, see [PORTS.md](PORT
 
 <br>
 
-![Uspector Network Scanner Screenshot](media/uspector_screenshot.png)
+![Uspector LAN Scanning Screenshot](media/uspector_screenshot1.png)
+
+![Uspector Traffic Inspection Screenshot](media/uspector_screenshot2.png)
 
 ---
 
