@@ -4,6 +4,16 @@
     </a>
 </div>
 
+<br>
+
+<div align="center">
+<a href="#overview"><b>Overview</b></a> &nbsp; ✦ &nbsp;
+<a href="#installation"><b>Installation</b></a>
+</div>
+
+<br>
+
+<a name="overview"></a>
 # Uspector Network Scanner
 
 **Uspector** is a lightweight, cross-platform Python network scanner that enables device discovery and open port detection across local IPv4 networks, including Wi-Fi and Ethernet.
@@ -49,6 +59,8 @@ Because the application performs network discovery and scanning, some antivirus 
 If you trust this application, you may need to add it as an exception in your antivirus software.
 
 ---
+
+<a name="installation"></a>
 
 ## 💾 Installation
 
