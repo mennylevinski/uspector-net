@@ -66,12 +66,12 @@ If Microsoft Defender SmartScreen appears:
 
 ### 🐍 Cross-platform
 
-#### 1️ Requirements
+#### 1️⃣ Requirements
 - Python **3.0+**
 - Works on **Windows**, **Linux**
 - Requires: `pip install psutil`
 
-#### 2️ Script
+#### 2️⃣ Script
 - Download the script [uspector_net.py](src/uspector_net.py)
 
 #### 3️⃣ Run
