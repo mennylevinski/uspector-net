@@ -26,7 +26,6 @@ import threading
 import itertools
 import psutil
 from typing import List, Dict, Iterable, Optional
-from io import StringIO
 
 version = "1.4.0"
 
@@ -381,7 +380,7 @@ def discover_network(subnet, local_ip=None, do_port_scan=False, fast=False, port
         for port in tcp_ports:
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(0.3)  # tcp_timeout
+                    s.settimeout(tcp_timeout)
                     if s.connect_ex((ip, port)) == 0:
                         tcp_hits += 1
             except Exception:
@@ -941,7 +940,7 @@ while True:
             thread.join()
         
     elif scan_mode == "4":
-        input("\nGoodby! Press Enter to exit...")
+        input("\nGoodbye! Press Enter to exit...")
         sys.exit(0)
 
     export = input("\nExport logs to text file? (Y to export, Enter to skip): ").strip().lower()
