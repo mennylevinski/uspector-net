@@ -165,7 +165,6 @@ def _get_default_interface_and_ip() -> (Optional[str], Optional[str]):
     """
 
     try:
-        gws = psutil.net_if_stats()
         addrs = psutil.net_if_addrs()
 
         # Get default gateway using socket trick (most reliable cross-platform)
