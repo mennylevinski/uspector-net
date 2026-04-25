@@ -6,7 +6,7 @@ All notable changes to **Uspector Network Scanner** are documented in this file.
 ## [1.5.0] – 2026-04-25 Latest
 ### Added
 - Added a branded icon to the executable (EXE)
-- Updated and expanded common port scanning list to 54 unique ports
+- Updated and expanded common port scanning list to 53 unique ports
 - Enhanced real-time detection of short-lived TCP/HTTPS connections
 - Introduced pseudo-flow tracking for UDP traffic using socket observation
 - Reduces noise by applying TTL-based deduplication for repeated UDP activity
