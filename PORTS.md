@@ -18,7 +18,6 @@ This file lists the common ports that **Uspector** scans, along with their stand
 | 123    | UDP       | NTP                                |
 | 137    | UDP       | NetBIOS Name Service               |
 | 138    | UDP       | NetBIOS Datagram Service           |
-| 139    | TCP       | NetBIOS Session Service            |
 | 161    | UDP       | SNMP                               |
 | 162    | UDP       | SNMP Trap                          |
 | 389    | TCP/UDP   | LDAP                               |
