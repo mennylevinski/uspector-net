@@ -27,10 +27,29 @@ import itertools
 import psutil
 from typing import List, Dict, Iterable, Optional
 
-version = "1.4.0"
+version = "1.5.0"
 
 log_buffer = io.StringIO()
 now = datetime.datetime.now().replace(microsecond=0)
+
+# ====== Icon Setup =======
+ICO_ICON = "uspector_icon.ico"
+PNG_ICON = "uspector_icon.png"
+
+def resource_path(relative_path):
+    if hasattr(sys, "_MEIPASS"):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
+
+def set_window_icon(window):
+    try:
+        window.iconbitmap(resource_path(ICO_ICON))
+    except Exception:
+        try:
+            from tkinter import PhotoImage
+            window.iconphoto(False, PhotoImage(file=resource_path(PNG_ICON)))
+        except Exception:
+            pass
 
 # ====== Logger Setup =======
 def setup_logger(level=logging.INFO, logfile: Optional[str] = None):
@@ -94,6 +113,64 @@ def resource_path(relative_path):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
 
+# ======= Noise filter helper =======
+NOISE_PORTS = {
+    5353,   # mDNS
+    1900,   # SSDP / UPnP
+    123,    # NTP
+    137, 138, 139, # NetBIOS / SMB noise
+    0
+}
+
+NOISE_IP_PREFIXES = (
+    "127.",      # loopback
+    "169.254.",  # APIPA
+    "fe80:",     # IPv6 link-local
+    "::1",
+    "::",
+)
+
+def _is_noise_traffic(conn) -> bool:
+    try:
+        if conn.status not in ("ESTABLISHED", "CLOSE_WAIT", "SYN_SENT", "LISTEN"):
+            return True
+
+        l_ip = conn.laddr.ip if conn.laddr else ""
+        r_ip = conn.raddr.ip if conn.raddr else ""
+
+        l_port = conn.laddr.port if conn.laddr else 0
+
+        # -------------------------
+        # DROP IPv6 LINK-LOCAL NOISE
+        # -------------------------
+        if isinstance(l_ip, str) and l_ip.startswith("fe80:"):
+            return True
+        if isinstance(r_ip, str) and r_ip.startswith("fe80:"):
+            return True
+
+        # IPv6 multicast / local service noise
+        if l_ip in ("::", "::1"):
+            return True
+
+        # -------------------------
+        # IPv4 noise ranges
+        # -------------------------
+        if l_ip.startswith(("127.", "169.254.")):
+            return True
+
+        # Service discovery ports
+        if l_port in NOISE_PORTS:
+            return True
+
+        # UDP broadcast noise
+        if conn.type == socket.SOCK_DGRAM and not conn.raddr:
+            return True
+
+        return False
+
+    except Exception:
+        return True
+
 # ======= Spinner (moving dots) =======
 class Spinner:
     """Simple console spinner/dots animation in a separate thread."""
@@ -119,7 +196,9 @@ class Spinner:
         self.thread.join()
 
 # Default common ports to check quickly
-COMMON_PORTS = [20, 21, 22, 23, 67, 68, 69, 80, 53, 123, 137, 138, 161, 389, 443, 445, 636, 989, 1433, 1434, 1521, 1900, 2222, 2375, 2376, 2049, 5601, 3306, 3389, 5432, 5060, 5061, 5900, 5985, 5986, 6379, 8000, 8080, 8443, 9042, 10443, 30015, 27017]
+COMMON_PORTS_TCP = [20, 21, 22, 23, 53, 67, 68, 69, 80, 123, 137, 138, 139, 161, 389, 443, 445, 636, 989, 1433, 1434, 1521, 1900, 2222, 2375, 2376, 2049, 5601, 3306, 3389, 5432, 5060, 5061, 5900, 5985, 5986, 6379, 8000, 8080, 8443, 9042, 10443, 30015, 27017]
+
+COMMON_PORTS_UDP = [53, 67, 68, 69, 123, 137, 138, 161, 162, 389, 500, 514, 520, 1434, 1900, 3478, 4500, 5353, 5683, 11211, 27015]
 
 # OS detection
 IS_WINDOWS = platform.system().lower().startswith("win")
@@ -354,7 +433,7 @@ def discover_network(subnet, local_ip=None, do_port_scan=False, fast=False, port
     """
 
     if ports is None:
-        ports = COMMON_PORTS
+        ports = COMMON_PORTS_TCP + COMMON_PORTS_UDP
 
     if subnet is None and local_ip:
         subnet = guess_subnet(local_ip, 24)
@@ -540,77 +619,110 @@ def _detect_direction(laddr_ip: str, raddr_ip: str, local_subnet: Optional[ipadd
 
     except ValueError:
         return "OUT"  # default fallback
-
+    
 def start_connection_inspector(
     interval: float = 1.0,
     ports: Optional[List[int]] = None,
     timeout: int = 0,
     skip_time_wait: bool = True
 ):
-    """
-    Inspect active TCP connections every `interval` seconds.
-    skip_time_wait: if True, ignores TIME_WAIT connections.
-    timeout: max runtime in seconds (0 = unlimited)
-    """
     stop_event = threading.Event()
     ports_set = set(ports) if ports else None
-    seen = set()  # store already logged connections
+    seen = set()
 
-    # Detect local IP once
-    local_iface, local_ip = _get_default_interface_and_ip()
-    if not local_ip:
-        local_ip = "0.0.0.0"  # fallback
+    _, local_ip = _get_default_interface_and_ip()
+    local_ip = local_ip or "0.0.0.0"
     local_subnet = guess_subnet(local_ip, 24)
 
     def _inspector():
-        logging.info(f"\n=== Connection Inspector started (ports: {ports if ports else 'all'}) ===")
+        logging.info(
+            f"\n=== Connection Inspector started "
+            f"(ports: {ports if ports else 'all'}) ==="
+        )
+
         start_time = time.time()
 
         while not stop_event.is_set():
             now = time.time()
+
             try:
-                for conn in psutil.net_connections(kind='inet'):
-                    if not conn.laddr or not conn.raddr:
+                for conn in psutil.net_connections(kind="inet"):
+
+                    # must have local address
+                    if not conn.laddr:
                         continue
 
-                    lport, rport = conn.laddr.port, conn.raddr.port
+                    proto = "UDP" if conn.type == socket.SOCK_DGRAM else "TCP"
 
-                    # Only selected ports
-                    if ports_set and lport not in ports_set and rport not in ports_set:
+                    l_ip = conn.laddr.ip
+                    l_port = conn.laddr.port
+
+                    r_ip = conn.raddr.ip if conn.raddr else None
+                    r_port = conn.raddr.port if conn.raddr else None
+
+                    # FIX 1: TIME_WAIT filter (TCP only)
+                    if skip_time_wait and proto == "TCP" and conn.status == "TIME_WAIT":
                         continue
 
-                    # Skip TIME_WAIT if requested
-                    if skip_time_wait and conn.status == "TIME_WAIT":
+                    # FIX 2: PORT FILTER (safe for UDP too)
+                    if ports_set:
+                        if l_port not in ports_set and (r_port not in ports_set if r_port else True):
+                            continue
+
+                    # FIX 3: CLEAN NOISE FILTER (DO NOT kill UDP)
+                    if _is_noise_traffic(conn):
                         continue
 
-                    key = (conn.pid, conn.laddr.ip, lport, conn.raddr.ip, rport, conn.status)
+                    # FIX 4: LISTEN CLEANUP (only TCP logic)
+                    if conn.status == "LISTEN":
+                        if l_ip in ("127.0.0.1", "::1", "0.0.0.0", "::"):
+                            continue
+                        if l_port in NOISE_PORTS:
+                            continue
+
+                    key = (conn.pid, l_ip, l_port, r_ip, r_port, conn.status)
                     if key in seen:
                         continue
                     seen.add(key)
 
-                    pid = conn.pid or "N/A"
                     proc_name = _get_process_name(conn.pid)
-                    src_ip, dst_ip = conn.laddr.ip, conn.raddr.ip
 
-                    # FIXED: Detect direction correctly
-                    direction = _detect_direction(src_ip, dst_ip, local_subnet=local_subnet)
+                    # FIX 5: CORRECT DIRECTION LOGIC
+                    if conn.status == "LISTEN":
+                        direction = "LISTEN"
+                        src = f"{l_ip}:{l_port}"
+                        dst = "*:*"
 
-                    logging.info(f"[FLOW] {direction} {proc_name} {src_ip}:{lport} → {dst_ip}:{rport} ({conn.status})")
+                    elif r_ip:
+                        direction = _detect_direction(l_ip, r_ip, local_subnet)
+                        src = f"{l_ip}:{l_port}"
+                        dst = f"{r_ip}:{r_port}"
 
-                # Clean up memory occasionally
+                    else:
+                        direction = "LOCAL"
+                        src = f"{l_ip}:{l_port}"
+                        dst = "*:*"
+
+                    # FINAL OUTPUT
+                    logging.info(
+                        f"[FLOW] {proto} {direction} {proc_name} "
+                        f"{src} → {dst} ({conn.status})"
+                    )
+
+                # memory cleanup
                 if len(seen) > 5000:
                     seen.clear()
 
             except Exception as e:
-                logging.debug(f"[Inspector Error] {e}")
+                logging.error(f"[Inspector Error] {e}")
 
-            # Timeout
+            # timeout
             if timeout > 0 and (now - start_time) >= timeout:
                 logging.info("Traffic inspection timeout reached.")
                 stop_event.set()
                 break
 
-            time.sleep(interval)
+            time.sleep(min(interval, 0.2))
 
         logging.info("=== Traffic inspection stopped ===")
 
@@ -922,11 +1034,6 @@ while True:
                 ports_to_monitor = None
         else:
             ports_to_monitor = None
-
-        choice = input("\nStart traffic inspection? (Y/N): ").strip().upper()
-        if choice != "Y":
-            print("Traffic inspection cancelled.")
-            continue
 
         stop_event, thread = start_connection_inspector(interval=2, ports=ports_to_monitor)
 
