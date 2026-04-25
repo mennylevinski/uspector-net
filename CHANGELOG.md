@@ -2,7 +2,17 @@
 All notable changes to **Uspector Network Scanner** are documented in this file.
 
 ---
-## [1.4.0] – 2026-04-05 Latest
+
+## [1.5.0] – 2026-04-25 Latest
+### Added
+- Added a branded icon to the executable (EXE)
+- Enhanced real-time detection of short-lived TCP/HTTPS connections
+- Introduced pseudo-flow tracking for UDP traffic using socket observation
+- Reduces noise by applying TTL-based deduplication for repeated UDP activity
+
+---
+
+## [1.4.0] – 2026-04-05
 ### Added
 - Added a basic Traffic Inspection feature as option 3 (Beta)
 - Real-time monitoring of active TCP connections for selected ports
