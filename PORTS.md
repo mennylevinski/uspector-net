@@ -1,4 +1,4 @@
-# Common Ports Scanned by Uspector (v1.4.0)
+# Common Ports Scanned by Uspector (v1.5.0)
 
 This file lists the common ports that **Uspector** scans, along with their standard protocols and associated services.  
 
