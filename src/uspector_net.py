@@ -20,7 +20,6 @@ import socket
 import logging
 import datetime
 import warnings
-import requests
 import ipaddress
 import subprocess
 import concurrent.futures
@@ -28,9 +27,6 @@ import threading
 import itertools
 import psutil
 from typing import List, Dict, Iterable, Optional
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
-
-warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
 version = "1.6.0"
 
@@ -448,6 +444,7 @@ def discover_network(subnet, local_ip=None, do_port_scan=False, fast=False, port
 
     # ---- Step 0: Pre-populate ARP cache ----
     ips = [str(ip) for ip in subnet.hosts()]
+    logging.info("")
     logging.info(f"Pre-pinging {len(ips)} IPs to populate ARP cache...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=200) as ex:
         list(ex.map(lambda ip: _ping(ip, timeout_ms=300), ips))
@@ -583,47 +580,6 @@ def _primary_mac() -> Optional[str]:
     except Exception:
         return None
 
-# ======= HTTP request (real detection) =======
-def http_probe(ip, timeout=2):
-    urls = [
-        f"http://{ip}",
-        f"http://{ip}:80",
-        f"http://{ip}:8080",
-        f"http://{ip}:8000",
-        f"https://{ip}",
-        f"https://{ip}:443",
-        f"https://{ip}:8443",
-    ]
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (NetworkScanner)"
-    }
-
-    for url in urls:
-        try:
-            r = requests.get(
-                url,
-                headers=headers,
-                timeout=(2, timeout),
-                allow_redirects=True,
-                verify=False   # important for routers with self-signed certs
-            )
-
-            return {
-                "url": url,
-                "status": r.status_code,
-                "server": r.headers.get("Server", "Unknown")
-            }
-
-        except requests.exceptions.SSLError:
-            # try again as HTTP fallback
-            continue
-
-        except requests.exceptions.RequestException:
-            continue
-
-    return None
-
 # ======= Connection Inspector (Controlled) =======
 def _get_process_name(pid):
     try:
@@ -677,8 +633,9 @@ def start_connection_inspector(
     local_subnet = guess_subnet(local_ip, 24)
 
     def _inspector():
+        logging.info("")
         logging.info(
-            f"\n=== Connection Inspector started "
+            f"=== Connection Inspector started "
             f"(ports: {ports if ports else 'all'}) ==="
         )
 
@@ -805,8 +762,8 @@ def test_print(
 
     header_line = "  ".join(h.center(w) for h, w in zip(headers, col_widths))
     sep_line = "–" * len(header_line)
-
-    logging.info(f"\n\nScanned subnet: {subnet} — found {len(devices)} devices")
+    logging.info("")
+    logging.info(f"Scanned subnet: {subnet} — found {len(devices)} devices")
     logging.info(sep_line)
     logging.info(header_line)
     logging.info(sep_line)
@@ -893,6 +850,7 @@ if __name__ == "__main__":
             log_file = "scan.log"
 
     setup_logger(level=log_level, logfile=log_file)
+    scan_lock = threading.Lock()
 
     # --- Detect local IP and subnet ---
     print(f"MIT License – © 2025 Menahem Levinski\n")
@@ -921,7 +879,7 @@ if __name__ == "__main__":
 
 # --- Ask user which scan to perform (LAN or custom) ---
 MAX_RANGE_SIZE = 512
-scan_results = []
+scan_results = {}
 
 # --- Helper functions ---
 def _ip_range_from_full_ips(start_ip: str, end_ip: str) -> List[str]:
@@ -941,7 +899,6 @@ def show_menu():
 
     print(f"{'scan -L':10} LAN scanning")
     print(f"{'scan -R':10} Custom IP range")
-    print(f"{'scan -S':10} HTTP service scanning (LAN only)")
     print(f"{'scan -T':10} Traffic Inspection")
     print(f"{'help':10} Show this menu")
     print(f"{'exit':10} Exit the program")
@@ -951,7 +908,7 @@ show_menu()
 while True:
     scan_mode = input("\n> ").strip().lower()
 
-    if scan_mode not in {"scan -l", "scan -r", "scan -s", "scan -t", "help", "exit", ""}:
+    if scan_mode not in {"scan -l", "scan -r", "scan -t", "help", "exit", ""}:
         print("Invalid command!")
         continue
 
@@ -975,6 +932,7 @@ while True:
             print("LAN scan cancelled.")
             continue
 
+        scan_results.clear()
         spinner = Spinner("Running LAN scan")
         spinner.start()
         start = time.time()
@@ -985,7 +943,10 @@ while True:
                 do_port_scan=True,
                 fast=True
             )
-            scan_results.extend(results)
+            for d in results:
+                key = d.get("ip") or d.get("mac")
+                if key and key not in scan_results:
+                    scan_results[key] = d
         finally:
             spinner.stop()
             elapsed = time.time() - start
@@ -1015,10 +976,11 @@ while True:
 
         print(f"\nTarget IPs: {len(target_ips)}")
         print(", ".join(target_ips[:10]) + (" ..." if len(target_ips) > 10 else ""))
+        
+        logging.info("")
+        logging.info(f"Starting custom scan for {len(target_ips)} targets...")
 
-        logging.info(f"\nStarting custom scan for {len(target_ips)} targets...")
-
-        scan_results = {}
+        scan_results.clear()
         ip_mac = _parse_arp_table()
 
         spinner = Spinner("Running custom scan")
@@ -1062,8 +1024,10 @@ while True:
             if results:
                 for d in results:
                     key = d.get("ip") or d.get("mac")
-                    if key and key not in scan_results:
-                        scan_results[key] = d
+                    if key:
+                        with scan_lock:
+                            if key not in scan_results:
+                                scan_results[key] = d
 
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=50) as ex:
@@ -1077,63 +1041,11 @@ while True:
                 logging.info(
                     f"Custom scan finished in {elapsed:.1f}s — found {len(scan_results)} devices."
                 )
-                print_devices(list(scan_results.values()))
+                devices_snapshot = list(scan_results.values())
+                print_devices(devices_snapshot)
             else:
                 print(f"Custom scan finished in {elapsed:.1f}s - No devices found.")
 
-    elif scan_mode == "scan -s":
-
-        if not subnet:
-            print("No subnet detected.")
-            continue
-
-        ips = [str(ip) for ip in subnet.hosts()]
-
-        print(f"\nPre-filtering {len(ips)} hosts (ICMP + ARP)...")
-
-        alive_ips = set()
-        ip_mac = _parse_arp_table()
-
-        # STEP 1A: ICMP check
-        with concurrent.futures.ThreadPoolExecutor(max_workers=100) as ex:
-            for ip, ok in zip(ips, ex.map(_ping, ips)):
-                if ok:
-                    alive_ips.add(ip)
-
-        # STEP 1B: ARP fallback (THIS is what makes DG appear)
-        for ip in ip_mac.keys():
-            if ip in ips:
-                alive_ips.add(ip)
-
-        alive_ips = list(alive_ips)
-
-        print(f"Alive hosts: {len(alive_ips)}\n")
-
-        results = []
-
-        spinner = Spinner("Scanning HTTP services")
-        spinner.start()
-
-        try:
-            def check(ip):
-                return (ip, http_probe(ip, timeout=2))
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=80) as ex:
-                for ip, res in ex.map(check, alive_ips):
-                    if res:
-                        results.append({
-                            "ip": ip,
-                            "url": res["url"],
-                            "status": res["status"],
-                            "server": res["server"]
-                        })
-
-        finally:
-            spinner.stop()
-
-        for r in results:
-            logging.info(f"[HTTP] {r['ip']} → {r['status']} {r['server']}")
-            
     elif scan_mode == "scan -t":
         # --- Ask for timeout ---
         try:
