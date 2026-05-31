@@ -19,16 +19,19 @@ import platform
 import socket
 import logging
 import datetime
-import warnings
 import ipaddress
 import subprocess
 import concurrent.futures
 import threading
 import itertools
 import psutil
+import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 from typing import List, Dict, Iterable, Optional
 
-version = "1.6.0"
+version = "1.7.0"
 
 log_buffer = io.StringIO()
 now = datetime.datetime.now().replace(microsecond=0)
@@ -192,6 +195,49 @@ class Spinner:
         self._stop_event.set()
         self.thread.join()
 
+# ======= HTTP request =======
+def http_probe(ip, timeout=2):
+    urls = [
+        f"http://{ip}",
+        f"http://{ip}:80",
+        f"http://{ip}:8080",
+        f"http://{ip}:8000",
+        f"https://{ip}",
+        f"https://{ip}:443",
+        f"https://{ip}:8443",
+        f"https://{ip}:10443",
+    ]
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (NetworkScanner)"
+    }
+
+    for url in urls:
+        try:
+            r = requests.get(
+                url,
+                headers=headers,
+                timeout=(2, timeout),
+                allow_redirects=True,
+                verify=False   # important for routers with self-signed certs
+            )
+
+            return {
+                "url": url,
+                "status": r.status_code,
+                "server": r.headers.get("Server", "Unknown")
+            }
+
+        except requests.exceptions.SSLError:
+            # try again as HTTP fallback
+            continue
+
+        except requests.exceptions.RequestException:
+            continue
+
+    return None
+
+# ======= LAN scanning configs =======
 # Default common ports to check quickly
 COMMON_PORTS_TCP = [20, 21, 22, 23, 80, 389, 443, 445, 636, 989, 1433, 1434, 1521, 2222, 2375, 2376, 2049, 5601, 3306, 3389, 5432, 5060, 5061, 5900, 5985, 5986, 6379, 8000, 8080, 8443, 9042, 10443, 30015, 27017]
 
@@ -856,7 +902,7 @@ if __name__ == "__main__":
     print(f"MIT License – © 2025 Menahem Levinski\n")
     interface, local = _get_default_interface_and_ip()
     mac = _primary_mac()
-    logging.info(f"Uspector version {version}\n")
+    logging.info(f"Uspector v{version}\n")
     logging.info(f"Interface: {interface or 'N/A'}")
     logging.info(f"Local MAC: {mac or 'N/A'}")   
     logging.info(f"Local Adapter IP: {local or 'N/A'}")
@@ -868,7 +914,7 @@ if __name__ == "__main__":
 
     elif isinstance(local, str) and "." in local:
         subnet = guess_subnet(local, 24)
-        logging.info(f"Guessed subnet: {subnet}")
+        logging.info(f"Detected subnet: {subnet}")
 
     else:
         logging.warning("Subnet guessing skipped (IPv6 or no IP)")
@@ -894,21 +940,23 @@ def _ip_range_from_full_ips(start_ip: str, end_ip: str) -> List[str]:
 
 # ---- Main scan loop ----
 def show_menu():
-    title = "Mod commands (case-insensitive):"
+    title = "Commands (case-insensitive):"
     print("\n" + title)
+    print("–" * len(title))
 
-    print(f"{'scan -L':10} LAN scanning")
-    print(f"{'scan -R':10} Custom IP range")
-    print(f"{'scan -T':10} Traffic inspection")
-    print(f"{'help':10} Show this menu")
-    print(f"{'exit':10} Exit the program")
+    print(f"{'scan -L':10} LAN scan (devices and ports)")
+    print(f"{'scan -R':10} Custom IP range scan")
+    print(f"{'scan -T':10} Device traffic inspection")
+    print(f"{'scan -S':10} HTTP service scan (LAN only)")
+    print(f"{'help':10} Display menu")
+    print(f"{'exit':10} Exit")
     
 show_menu()
 
 while True:
     scan_mode = input("\n> ").strip().lower()
 
-    if scan_mode not in {"scan -l", "scan -r", "scan -t", "help", "exit", ""}:
+    if scan_mode not in {"scan -l", "scan -r", "scan -s", "scan -t", "help", "exit", ""}:
         print("Invalid command!")
         continue
 
@@ -1046,6 +1094,59 @@ while True:
             else:
                 print(f"Custom scan finished in {elapsed:.1f}s - No devices found.")
 
+    elif scan_mode == "scan -s":
+
+        if not subnet:
+            print("No subnet detected.")
+            continue
+
+        ips = [str(ip) for ip in subnet.hosts()]
+
+        print(f"\nPre-filtering {len(ips)} hosts (ICMP + ARP)...")
+
+        alive_ips = set()
+        ip_mac = _parse_arp_table()
+
+        # STEP 1A: ICMP check
+        with concurrent.futures.ThreadPoolExecutor(max_workers=100) as ex:
+            for ip, ok in zip(ips, ex.map(_ping, ips)):
+                if ok:
+                    alive_ips.add(ip)
+
+        # STEP 1B: ARP fallback (THIS is what makes DG appear)
+        for ip in ip_mac.keys():
+            if ip in ips:
+                alive_ips.add(ip)
+
+        alive_ips = list(alive_ips)
+
+        print(f"Alive hosts: {len(alive_ips)}\n")
+
+        results = []
+
+        spinner = Spinner("Scanning HTTP services")
+        spinner.start()
+
+        try:
+            def check(ip):
+                return (ip, http_probe(ip, timeout=2))
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=80) as ex:
+                for ip, res in ex.map(check, alive_ips):
+                    if res:
+                        results.append({
+                            "ip": ip,
+                            "url": res["url"],
+                            "status": res["status"],
+                            "server": res["server"]
+                        })
+
+        finally:
+            spinner.stop()
+
+        for r in results:
+            logging.info(f"[HTTP] {r['ip']} → {r['status']} {r['server']}")
+            
     elif scan_mode == "scan -t":
         # --- Ask for timeout ---
         try:
