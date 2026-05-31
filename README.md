@@ -83,8 +83,8 @@ If Microsoft Defender SmartScreen appears:
 
 #### 1️⃣ Requirements
 - Python **3.0+**
-- Works on **Windows**, **Linux**
-- Requires: `pip install psutil`, `pip install requests`
+- Works on **Windows** & **Linux**
+- Dependencies: `pip install psutil`, `pip install requests`
 
 #### 2️⃣ Script
 - Download the script [uspector_net.py](src/uspector_net.py)
