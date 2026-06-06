@@ -29,17 +29,17 @@ Licensed under the [MIT License](LICENSE).
 
 - **LAN Detection Mode**, detects your IPv4 subnet and scans the local network
 - **Custom Scan Mode**, user can select to target a spesific IP address or IP ranges
+- **HTTP Service Scan**, identifies web services running on discovered hosts
 - **Fast & Accurate**, combines ICMP, ARP, and socket checks and auto discovery
 - **Port Detection**, scans common service ports (FTP, SMB, SSH, RDP, and more)
 - **Logging system**, exportable log file (TXT format) for more detailed output
-- **Terminal / CLI**, clean “black console” output, stays open after completion
 - **Basic Traffic Inspection** module, real-time monitoring of active TCP connections
 
 For a detailed list of all common ports scanned by Uspector, see [PORTS.md](PORTS.md)
 
 ---
 
-## Kali Linux
+## 🐉 Kali Linux
 
 ![Uspector – LAN Scanning](media/uspector_screenshot1.png)
 
