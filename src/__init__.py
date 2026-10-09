@@ -1,4 +1,4 @@
-# Uspector – Copyright (c) 2026 Menny Levinski
+# Uspector – Copyright (c) 2026 Menahem Levinski
 
 from .scanner import TLSScanner
 

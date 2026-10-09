@@ -1,4 +1,4 @@
-# Uspector – Copyright (c) 2026 Menny Levinski
+# Uspector – Copyright (c) 2026 Menahem Levinski
 
 import hashlib
 import ipaddress
