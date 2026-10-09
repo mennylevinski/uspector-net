@@ -6,7 +6,6 @@ import sys
 
 from .tlsscanner import TLSScanner
 
-
 def main():
     parser = argparse.ArgumentParser(
         prog="uspector",

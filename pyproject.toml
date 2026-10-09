@@ -10,15 +10,18 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [
-    { name = "Menny Levinski" }
+    { name = "Menahem Levinski" }
 ]
 dependencies = [
     "cryptography>=44.0.0"
 ]
 
 [project.scripts]
-uspector = "uspector_net.cli:main"
+uspector = "uspector.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/mennylevinski/uspector-net"
 Repository = "https://github.com/mennylevinski/uspector-net"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/uspector"]
