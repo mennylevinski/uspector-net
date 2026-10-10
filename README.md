@@ -1,3 +1,10 @@
+
+<div align="center" style="line-height: 0;">
+  <a href="https://github.com/mennylevinski/uspector-net">
+    <img src="img/uspector-main-logo2.png" alt="Uspector TLS and Certificate Scanner logo" width="200" height="200">
+  </a>
+</div>
+
 # Uspector
 
 A Python library for SSL/TLS security testing, certificate validation, and web diagnostics.
