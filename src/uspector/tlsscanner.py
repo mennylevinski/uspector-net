@@ -504,8 +504,8 @@ class TLSScanner:
                 result["diagnostic_error"] = str(diagnostic_exc)
 
                 result["findings"].append(
-                    "TLS handshake failed: the server did not complete "
-                    "a TLS connection using the available client settings"
+                    "TLS handshake failed: the server may require an unsupported "
+                    "legacy protocol or cipher suite"
                 )
 
         except (ssl.SSLError, OSError, ValueError) as exc:
@@ -546,8 +546,8 @@ class TLSScanner:
                 result["diagnostic_error"] = str(diagnostic_exc)
 
                 result["findings"].append(
-                    "TLS handshake failed: the server did not complete "
-                    "a TLS connection using the available client settings"
+                    "TLS handshake failed: the server may require an unsupported "
+                    "legacy protocol or cipher suite"
                 )
 
         finally:
