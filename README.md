@@ -57,3 +57,23 @@ Dependencies are installed automatically with the package.
 ## License
 
 Licensed under the MIT License. See [LICENSE](LICENSE) for details.
+
+## 📁 Project Structure
+
+uspector-net/                    # Main project folder
+│
+├── img/                          # Logo and media assets
+│
+├── uspector/                     # Python package source code
+│
+├── LICENSE                       # License file
+├── README.md                     # Project overview and usage
+└── pyproject.toml                # Package configuration and dependencies
+
+---
+
+<br>
+<p align="center">
+© 2026 Menahem Levinski. All rights reserved.
+<a href="#top">🔝</a>
+</p>
