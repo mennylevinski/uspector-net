@@ -72,6 +72,7 @@ uspector-net/                     # Main project folder
 │
 ├── LICENSE                       # License file
 ├── README.md                     # Project overview and usage
+├── SECURITY.md                   # Security policy
 └── pyproject.toml                # Package configuration and dependencies
 ```
 ---
