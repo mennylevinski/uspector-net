@@ -165,6 +165,7 @@ class TLSScanner:
         }
 
         if certificate is None:
+            result["status"] = "Certificate Unavailable"
             return result
 
         try:
@@ -184,18 +185,18 @@ class TLSScanner:
                     break
 
         except x509.ExtensionNotFound:
-            result["status"] = "Not Supported"
+            result["status"] = "URL Not Available"
             return result
 
         except Exception:
             return result
 
         if not result["url"]:
-            result["status"] = "Not Supported"
+            result["status"] = "URL Not Available"
             return result
 
-        # Find an available issuer certificate. Matching names alone do
-        # not cryptographically establish that a certificate is the issuer.
+        # Find a candidate issuer certificate.
+        # Matching names alone do not establish issuer authenticity.
         issuer = None
         certificate_fingerprint = certificate.fingerprint(hashes.SHA256())
 
@@ -252,8 +253,8 @@ class TLSScanner:
                 )
                 return result
 
-            # The response is parsed, but its authenticity and freshness
-            # are not checked. Do not treat this as a validated status.
+            # Parsed status only; response authenticity and freshness
+            # have not been validated.
             certificate_status = ocsp_response.certificate_status
 
             if certificate_status == ocsp.OCSPCertStatus.GOOD:
@@ -421,7 +422,7 @@ class TLSScanner:
                 dict.fromkeys(item[4][0] for item in addresses)
             )
 
-        except socket.gaierror as exc:
+        except OSError as exc:
             result["error"] = f"DNS resolution failed: {exc}"
             return result
 
