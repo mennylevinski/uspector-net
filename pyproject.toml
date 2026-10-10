@@ -13,7 +13,8 @@ authors = [
     { name = "Menahem Levinski" }
 ]
 dependencies = [
-    "cryptography>=44.0.0"
+    "cryptography>=44.0.0",
+	"requests>=2.32.0",
 ]
 
 [project.scripts]
