@@ -18,18 +18,18 @@ Upgrade to the latest version:
 
 Scan a hostname:
 
-    uspector secuditor.com
+    uspector example.com
 
 ### Python Library
 
     from uspector import Uspector
 
     scanner = Uspector()
-    result = scanner.scan("secuditor.com")
+    result = scanner.scan("example.com")
 
     print(result)
 
-Replace `secuditor.com` with the hostname you want to test.
+Replace `example.com` with the hostname you want to test.
 
 ## Features
 
