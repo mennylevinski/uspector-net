@@ -513,18 +513,9 @@ class TLSScanner:
                     "Certificate hostname does not match the requested domain"
                 )
 
-            elif "expired" in error_text:
-                result["findings"].append(
-                    "TLS certificate has expired"
-                )
-
-            elif "self-signed" in error_text:
-                result["findings"].append(
-                    "TLS certificate chain contains a self-signed certificate"
-                )
-
             elif (
-                "unable to get local issuer" in error_text
+                "self-signed certificate in certificate chain" in error_text
+                or "unable to get local issuer" in error_text
                 or "unable to verify the first certificate" in error_text
             ):
                 result["findings"].append(
