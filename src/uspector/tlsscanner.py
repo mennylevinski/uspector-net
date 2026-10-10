@@ -545,6 +545,11 @@ class TLSScanner:
                 result["diagnostic_handshake"] = "Failed"
                 result["diagnostic_error"] = str(diagnostic_exc)
 
+                result["findings"].append(
+                    "TLS handshake failed: the server did not complete "
+                    "a TLS connection using the available client settings"
+                )
+
         finally:
             result["latency_ms"] = round(
                 (time.perf_counter() - start_time) * 1000,
