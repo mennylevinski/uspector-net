@@ -258,12 +258,12 @@ class WebScanner:
                                 "missing alt text"
                             )
 
-                        if not seo["og_title"]:
+                        if not seo["has_og_title"]:
                             seo["findings"].append(
                                 "Missing Open Graph title"
                             )
 
-                        if not seo["og_description"]:
+                        if not seo["has_og_description"]:
                             seo["findings"].append(
                                 "Missing Open Graph description"
                             )
