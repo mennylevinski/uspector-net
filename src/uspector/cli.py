@@ -5,32 +5,68 @@ import json
 import sys
 
 from .tlsscanner import TLSScanner
+from .webscanner import WebScanner
+
 
 def main():
     parser = argparse.ArgumentParser(
         prog="uspector",
-        description="Inspect TLS configuration and certificates of a remote host.",
+        description="TLS inspection and passive web security diagnostics.",
     )
 
-    parser.add_argument(
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+    )
+
+    # TLS scanner
+    tls_parser = subparsers.add_parser(
+        "tls",
+        help="Inspect TLS configuration and certificates.",
+        description="Inspect TLS configuration and certificates.",
+    )
+    tls_parser.add_argument(
         "hostname",
         help="Hostname or IP address to scan.",
     )
-    parser.add_argument(
+    tls_parser.add_argument(
         "-p",
         "--port",
         type=int,
         default=443,
         help="Target port (default: 443).",
     )
-    parser.add_argument(
+    tls_parser.add_argument(
         "-t",
         "--timeout",
         type=float,
         default=5.0,
         help="Connection timeout in seconds (default: 5).",
     )
-    parser.add_argument(
+    tls_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output the complete result as JSON.",
+    )
+
+    # Web scanner
+    web_parser = subparsers.add_parser(
+        "web",
+        help="Inspect HTTP security headers, cookies, and response content.",
+        description="Perform passive HTTP security diagnostics.",
+    )
+    web_parser.add_argument(
+        "target",
+        help="Target URL or hostname.",
+    )
+    web_parser.add_argument(
+        "-t",
+        "--timeout",
+        type=float,
+        default=15.0,
+        help="HTTP timeout in seconds (default: 15).",
+    )
+    web_parser.add_argument(
         "--json",
         action="store_true",
         help="Output the complete result as JSON.",
@@ -39,13 +75,20 @@ def main():
     args = parser.parse_args()
 
     try:
-        scanner = TLSScanner(timeout=args.timeout)
-        result = scanner.check_tls(args.hostname, args.port)
+        if args.command == "tls":
+            scanner = TLSScanner(timeout=args.timeout)
+            result = scanner.check_tls(args.hostname, args.port)
+            title = f"Uspector TLS Scan: {args.hostname}:{args.port}"
+
+        else:
+            scanner = WebScanner(timeout=args.timeout)
+            result = scanner.scan(args.target)
+            title = f"Uspector Web Scan: {args.target}"
 
         if args.json:
             print(json.dumps(result, indent=2, default=str))
         else:
-            print(f"Uspector TLS Scan: {args.hostname}:{args.port}")
+            print(title)
             print("=" * 50)
 
             if isinstance(result, dict):
@@ -53,6 +96,9 @@ def main():
                     print(f"{key.replace('_', ' ').title()}: {value}")
             else:
                 print(result)
+
+        if isinstance(result, dict) and result.get("error"):
+            return 1
 
         return 0
 

@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "uspector"
-version = "1.0.3"
-description = "Python library for TLS configuration and certificate inspection"
+version = "1.0.4"
+description = "Python library for TLS inspection and passive web security diagnostics"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
