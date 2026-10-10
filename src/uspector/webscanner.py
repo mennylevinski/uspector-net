@@ -5,10 +5,10 @@ HTTP security diagnostics.
 """
 
 import socket
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
+from html.parser import HTMLParser
 
 import requests
-
 
 class WebScanner:
     def __init__(self, timeout: float = 15.0):
@@ -26,6 +26,7 @@ class WebScanner:
             "body_indicators": [],
             "resolved_ips": [],
             "error": None,
+            "seo": None,
         }
 
         try:
@@ -186,6 +187,107 @@ class WebScanner:
                             "Informational response-body indicators detected"
                         )
 
+                    
+                    if "text/html" in content_type:
+                        seo_parser = SEOHTMLParser()
+                        seo_parser.feed(
+                            bytes(body[:1024 * 1024]).decode(
+                                response.encoding or "utf-8",
+                                errors="replace",
+                            )
+                        )
+
+                        title = " ".join(
+                            "".join(seo_parser.title).split()
+                        )
+                        description = seo_parser.meta_description
+                        final_url = result["final_url"] or target
+
+                        seo = {
+                            "title": title or None,
+                            "title_length": len(title),
+                            "meta_description": description or None,
+                            "meta_description_length": len(description or ""),
+                            "canonical_url": (
+                                urljoin(final_url, seo_parser.canonical_url)
+                                if seo_parser.canonical_url
+                                else None
+                            ),
+                            "meta_robots": seo_parser.meta_robots,
+                            "x_robots_tag": headers.get("X-Robots-Tag"),
+                            "h1_count": len(seo_parser.h1_headings),
+                            "h1_headings": seo_parser.h1_headings,
+                            "html_language": seo_parser.html_lang,
+                            "image_count": seo_parser.image_count,
+                            "images_missing_alt": seo_parser.images_missing_alt,
+                            "og_title": seo_parser.og_title,
+                            "og_description": seo_parser.og_description,
+                            "findings": [],
+                        }
+
+                        if not title:
+                            seo["findings"].append("Missing page title")
+                        elif len(title) > 60:
+                            seo["findings"].append(
+                                "Page title exceeds 60 characters"
+                            )
+
+                        if not description:
+                            seo["findings"].append(
+                                "Missing meta description"
+                            )
+                        elif len(description) > 160:
+                            seo["findings"].append(
+                                "Meta description exceeds 160 characters"
+                            )
+
+                        if not seo["canonical_url"]:
+                            seo["findings"].append("Missing canonical URL")
+
+                        if seo["h1_count"] == 0:
+                            seo["findings"].append("Missing H1 heading")
+                        elif seo["h1_count"] > 1:
+                            seo["findings"].append("Multiple H1 headings")
+
+                        if not seo["html_language"]:
+                            seo["findings"].append(
+                                "Missing HTML language declaration"
+                            )
+
+                        if seo["images_missing_alt"]:
+                            seo["findings"].append(
+                                f"{seo['images_missing_alt']} image(s) "
+                                "missing alt text"
+                            )
+
+                        if not seo["og_title"]:
+                            seo["findings"].append(
+                                "Missing Open Graph title"
+                            )
+
+                        if not seo["og_description"]:
+                            seo["findings"].append(
+                                "Missing Open Graph description"
+                            )
+
+                        # Check whether search engines are instructed
+                        # not to index this page.
+                        robots_directives = " ".join(
+                            value for value in (
+                                seo["meta_robots"],
+                                seo["x_robots_tag"],
+                            )
+                            if value
+                        ).lower()
+
+                        if "noindex" in robots_directives:
+                            seo["findings"].append(
+                                "Noindex directive detected; search engines "
+                                "may exclude this page"
+                            )
+
+                        result["seo"] = seo
+
         except (ValueError, requests.RequestException) as exc:
             result["error"] = str(exc)
 
@@ -211,3 +313,80 @@ class WebScanner:
             )
 
         return target
+
+
+class SEOHTMLParser(HTMLParser):
+    """Extract basic on-page SEO signals from HTML."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.title = []
+        self.h1_headings = []
+        self.meta_description = None
+        self.meta_robots = None
+        self.canonical_url = None
+        self.og_title = None
+        self.og_description = None
+        self.html_lang = None
+        self.image_count = 0
+        self.images_missing_alt = 0
+        self._in_title = False
+        self._in_h1 = False
+        self._current_h1 = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        tag = tag.lower()
+
+        if tag == "html":
+            self.html_lang = attrs.get("lang")
+
+        elif tag == "title":
+            self._in_title = True
+
+        elif tag == "h1":
+            self._in_h1 = True
+            self._current_h1 = []
+
+        elif tag == "img":
+            self.image_count += 1
+            if not attrs.get("alt", "").strip():
+                self.images_missing_alt += 1
+
+        elif tag == "meta":
+            name = (attrs.get("name") or "").strip().lower()
+            prop = (attrs.get("property") or "").strip().lower()
+            content = (attrs.get("content") or "").strip()
+
+            if name == "description":
+                self.meta_description = content
+            elif name == "robots":
+                self.meta_robots = content
+            elif prop == "og:title":
+                self.og_title = content
+            elif prop == "og:description":
+                self.og_description = content
+
+        elif tag == "link":
+            rel = (attrs.get("rel") or "").lower().split()
+            href = attrs.get("href")
+            if "canonical" in rel and href:
+                self.canonical_url = href.strip()
+
+    def handle_data(self, data):
+        if self._in_title:
+            self.title.append(data)
+        if self._in_h1:
+            self._current_h1.append(data)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+
+        if tag == "title":
+            self._in_title = False
+
+        elif tag == "h1" and self._in_h1:
+            heading = " ".join("".join(self._current_h1).split())
+            self.h1_headings.append(heading)
+            self._current_h1 = []
+            self._in_h1 = False
