@@ -407,7 +407,15 @@ class TLSScanner:
                     raw_sock,
                     server_hostname=domain,
                 ) as tls_sock:
-                    if tls_sock.version() == expected:
+                    negotiated = tls_sock.version()
+
+                    print(
+                        f"[TLS PROBE] {domain}:{port} "
+                        f"requested={version_name} "
+                        f"negotiated={negotiated!r}"
+                    )
+
+                    if negotiated == expected:
                         supported_versions.append(version_name)
 
             except (ssl.SSLError, OSError, ValueError):
