@@ -1,13 +1,7 @@
-
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# Uspector – Copyright (c) 2026 Menahem Levinski
 
 """
-Uspector Passive Web Scanner
-Author: Menny Levinski
-
 HTTP security diagnostics.
-TLS certificate and protocol checks are handled by tlsscanner.py.
 """
 
 import socket
