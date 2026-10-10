@@ -5,7 +5,7 @@
   </a>
 </div>
 
-<h1 align="center">Uspector</h1>
+# Uspector
 
 A Python library for SSL/TLS security testing, certificate validation, and web diagnostics.
 
