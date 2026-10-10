@@ -503,6 +503,11 @@ class TLSScanner:
                 result["diagnostic_handshake"] = "Failed"
                 result["diagnostic_error"] = str(diagnostic_exc)
 
+                result["findings"].append(
+                    "TLS handshake failed: the server did not complete "
+                    "a TLS connection using the available client settings"
+                )
+
         except (ssl.SSLError, OSError, ValueError) as exc:
             result["ssl_error"] = str(exc)
 
