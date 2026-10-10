@@ -205,7 +205,7 @@ class WebScanner:
 
                         seo = {
                             "title_length": len(title),
-                            "meta_description": description or None,
+                            "has_meta_description": bool(description),
                             "meta_description_length": len(description or ""),
                             "canonical_url": (
                                 urljoin(final_url, seo_parser.canonical_url)
@@ -218,8 +218,8 @@ class WebScanner:
                             "html_language": seo_parser.html_lang,
                             "image_count": seo_parser.image_count,
                             "images_missing_alt": seo_parser.images_missing_alt,
-                            "og_title": seo_parser.og_title,
-                            "og_description": seo_parser.og_description,
+                            "has_og_title": bool(seo_parser.og_title),
+                            "has_og_description": bool(seo_parser.og_description),
                             "findings": [],
                         }
 
