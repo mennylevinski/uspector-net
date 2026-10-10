@@ -1,4 +1,3 @@
-
 name: Linux Build
 
 on:
@@ -44,12 +43,16 @@ jobs:
             --paths src \
             --collect-all cryptography \
             --copy-metadata cryptography \
+            --collect-all requests \
+            --copy-metadata requests \
             --distpath dist/linux \
             uspector_entry.py
 
       - name: Test executable
         run: |
           ./dist/linux/uspector --help
+          ./dist/linux/uspector tls --help
+          ./dist/linux/uspector web --help
           file dist/linux/uspector
 
       - name: Upload Linux executable
