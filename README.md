@@ -1,6 +1,6 @@
 # Uspector
 
-A Python library for SSL/TLS security testing, certificate validation, and network diagnostics.
+A Python library for SSL/TLS security testing, certificate validation, and web diagnostics.
 
 ## Installation
 
