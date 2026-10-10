@@ -204,7 +204,6 @@ class WebScanner:
                         final_url = result["final_url"] or target
 
                         seo = {
-                            "title": title or None,
                             "title_length": len(title),
                             "meta_description": description or None,
                             "meta_description_length": len(description or ""),
@@ -216,7 +215,6 @@ class WebScanner:
                             "meta_robots": seo_parser.meta_robots,
                             "x_robots_tag": headers.get("X-Robots-Tag"),
                             "h1_count": len(seo_parser.h1_headings),
-                            "h1_headings": seo_parser.h1_headings,
                             "html_language": seo_parser.html_lang,
                             "image_count": seo_parser.image_count,
                             "images_missing_alt": seo_parser.images_missing_alt,
