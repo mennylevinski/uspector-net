@@ -28,14 +28,24 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install . pyinstaller
 
+      - name: Create build entry point
+        run: |
+          cat > uspector_entry.py <<'PY'
+          from uspector.cli import main
+
+          if __name__ == "__main__":
+              main()
+          PY
+
       - name: Build executable
         run: |
           pyinstaller --clean --onefile \
             --name uspector \
+            --paths src \
             --collect-all cryptography \
             --copy-metadata cryptography \
             --distpath dist/linux \
-            src/uspector/cli.py
+            uspector_entry.py
 
       - name: Test executable
         run: |
