@@ -60,6 +60,7 @@ Licensed under the MIT License. See [LICENSE](LICENSE) for details.
 
 ## 📁 Project Structure
 
+```bash
 uspector-net/                    # Main project folder
 │
 ├── img/                          # Logo and media assets
@@ -69,7 +70,7 @@ uspector-net/                    # Main project folder
 ├── LICENSE                       # License file
 ├── README.md                     # Project overview and usage
 └── pyproject.toml                # Package configuration and dependencies
-
+```
 ---
 
 <br>
