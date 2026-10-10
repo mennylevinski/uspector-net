@@ -61,11 +61,13 @@ Licensed under the MIT License. See [LICENSE](LICENSE) for details.
 ## 📁 Project Structure
 
 ```bash
-uspector-net/                    # Main project folder
+uspector-net/                     # Main project folder
 │
 ├── img/                          # Logo and media assets
 │
-├── uspector/                     # Python package source code
+├── src/uspector/                 # Python package source code
+│
+├── tests/                        # Automated tests
 │
 ├── LICENSE                       # License file
 ├── README.md                     # Project overview and usage
