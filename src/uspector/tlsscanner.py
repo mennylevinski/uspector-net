@@ -515,6 +515,7 @@ class TLSScanner:
 
             elif (
                 "self-signed certificate in certificate chain" in error_text
+                or "self-signed certificate" in error_text
                 or "unable to get local issuer" in error_text
                 or "unable to verify the first certificate" in error_text
             ):
