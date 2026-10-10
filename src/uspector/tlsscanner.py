@@ -409,12 +409,6 @@ class TLSScanner:
                 ) as tls_sock:
                     negotiated = tls_sock.version()
 
-                    print(
-                        f"[TLS PROBE] {domain}:{port} "
-                        f"requested={version_name} "
-                        f"negotiated={negotiated!r}"
-                    )
-
                     if negotiated == expected:
                         supported_versions.append(version_name)
 
