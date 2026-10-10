@@ -112,6 +112,46 @@ class TLSScanner:
 
         raise TypeError("Unsupported certificate representation")
 
+    # ====== Independent Hostname Validation ======
+    @staticmethod
+    def _certificate_hostname_matches(certificate, domain):
+        """Match certificate SAN against a DNS hostname or IP address."""
+
+        try:
+            san = certificate.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName
+            ).value
+        except x509.ExtensionNotFound:
+            return False
+
+        try:
+            ip = ipaddress.ip_address(domain)
+        except ValueError:
+            ip = None
+
+        if ip is not None:
+            return ip in san.get_values_for_type(x509.IPAddress)
+
+        domain = domain.lower().rstrip(".")
+        dns_names = san.get_values_for_type(x509.DNSName)
+
+        for name in dns_names:
+            name = name.lower().rstrip(".")
+
+            if name == domain:
+                return True
+
+            if name.startswith("*."):
+                suffix = name[2:]
+
+                if (
+                    domain.endswith("." + suffix)
+                    and domain.count(".") == suffix.count(".") + 1
+                ):
+                    return True
+
+        return False
+
     # ====== Certificate Chain ======
     def _get_certificate_chain(self, tls_sock, leaf_certificate):
         """Return available parsed certificates, with the leaf first."""
