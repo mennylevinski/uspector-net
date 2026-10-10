@@ -472,8 +472,7 @@ class TLSScanner:
             result["error"] = "DNS returned no usable addresses"
             return result
 
-        # A DNS failure should not be confused with a certificate problem.
-        # The connection attempt itself determines the final connection status.
+        # Standard TLS connection with certificate verification.
         context = ssl.create_default_context()
         context.check_hostname = True
         context.verify_mode = ssl.CERT_REQUIRED
@@ -497,7 +496,7 @@ class TLSScanner:
 
             certificate = inspected["certificate_obj"]
             certificate_chain = inspected["certificate_chain"]
-      
+
         except ssl.SSLCertVerificationError as exc:
             result["ssl_error"] = str(exc)
             error_text = str(exc).lower()
@@ -517,6 +516,10 @@ class TLSScanner:
                 result["findings"].append(
                     "TLS certificate is self-signed and not trusted"
                 )
+
+            elif "certificate has expired" in error_text:
+                # Expiration is reported once by _check_certificate_validity().
+                pass
 
             elif (
                 "unable to get local issuer" in error_text
@@ -612,7 +615,6 @@ class TLSScanner:
                 1,
             )
 
-        
         # Certificate details.
         if certificate is not None:
             hostname_matches = self._certificate_hostname_matches(
@@ -712,8 +714,7 @@ class TLSScanner:
                     "the response has not been cryptographically validated"
                 )
 
-        # Probe TLS versions. Failed probes are not evidence that versions
-        # are disabled; only successful negotiations are reported here.
+        # Probe TLS versions. Failed probes do not prove versions are disabled.
         result["supported_tls_versions"] = (
             self._check_tls_protocol_support(domain, port)
         )
