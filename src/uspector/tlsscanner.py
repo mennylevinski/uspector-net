@@ -455,13 +455,9 @@ class TLSScanner:
 
             certificate = inspected["certificate_obj"]
             certificate_chain = inspected["certificate_chain"]
-
+      
         except ssl.SSLCertVerificationError as exc:
             result["ssl_error"] = str(exc)
-            result["findings"].append(
-                "TLS certificate verification failed"
-            )
-
             error_text = str(exc).lower()
 
             if (
@@ -473,6 +469,29 @@ class TLSScanner:
                 result["hostname_valid"] = False
                 result["findings"].append(
                     "Certificate hostname does not match the requested domain"
+                )
+
+            elif "expired" in error_text:
+                result["findings"].append(
+                    "TLS certificate has expired"
+                )
+
+            elif "self-signed" in error_text:
+                result["findings"].append(
+                    "TLS certificate chain contains a self-signed certificate"
+                )
+
+            elif (
+                "unable to get local issuer" in error_text
+                or "unable to verify the first certificate" in error_text
+            ):
+                result["findings"].append(
+                    "TLS certificate chain could not be verified to a trusted issuer"
+                )
+
+            else:
+                result["findings"].append(
+                    f"TLS certificate verification failed: {exc}"
                 )
 
             # Diagnostic-only retry. This never marks the connection trusted.
@@ -556,8 +575,24 @@ class TLSScanner:
                 1,
             )
 
+        
         # Certificate details.
         if certificate is not None:
+            hostname_matches = self._certificate_hostname_matches(
+                certificate,
+                domain,
+            )
+            result["hostname_valid"] = hostname_matches
+
+            if not hostname_matches:
+                finding = (
+                    "Certificate hostname does not match "
+                    "the requested domain"
+                )
+
+                if finding not in result["findings"]:
+                    result["findings"].append(finding)
+
             result["subject"] = certificate.subject.rfc4514_string()
             result["issuer"] = certificate.issuer.rfc4514_string()
 
@@ -673,17 +708,23 @@ class TLSScanner:
                 )
 
         # Final verdict.
-        if result["connection_status"] != "Passed":
-            result["verdict"] = "INCONCLUSIVE"
+        if result["connection_status"] == "Passed":
+            if (
+                result["hostname_valid"] is False
+                or result["findings"]
+            ):
+                result["verdict"] = "WARNING"
+            else:
+                result["verdict"] = "SECURE"
 
-        elif result["hostname_valid"] is not True:
-            result["verdict"] = "WARNING"
-
-        elif result["findings"]:
+        elif (
+            result["diagnostic_handshake"] == "Passed"
+            and result["findings"]
+        ):
             result["verdict"] = "WARNING"
 
         else:
-            result["verdict"] = "SECURE"
+            result["verdict"] = "INCONCLUSIVE"
 
         return result
 
