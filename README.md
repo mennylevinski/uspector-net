@@ -1,18 +1,8 @@
- <a name="top"></a>
+# Uspector — SSL/TLS Security, DNS & Web Diagnostics
 
-<div align="center">
+Uspector is a Python library and command-line tool for SSL/TLS inspection, DNS diagnostics, certificate validation, and passive web security diagnostics.
 
-  <a href="https://github.com/mennylevinski/uspector-net">
-    <img src="img/uspector-main-logo2.png" alt="Uspector TLS and Web Security Scanner logo" width="200" height="200">
-  </a>
-
-</div>
-
-# Uspector — SSL/TLS Security & Web Diagnostics
-
-Uspector is a Python library and command-line tool for SSL/TLS inspection, certificate validation, and passive web security diagnostics.
-
-It helps developers and security professionals inspect TLS configurations, review certificate details, and identify common web security and SEO configuration issues.
+It helps developers and security professionals inspect TLS configurations, review certificate details, analyze important DNS records, and identify common web security and SEO configuration issues.
 
 ## Installation
 
@@ -32,7 +22,19 @@ Requirements: Python 3.10 or later.
 
 ## Command-Line Interface
 
-Uspector provides separate commands for TLS inspection and web diagnostics.
+Uspector provides separate commands for DNS diagnostics, TLS inspection, and web diagnostics.
+
+### DNS diagnostics
+
+Scan a domain:
+
+```bash
+uspector dns example.com
+```
+
+The DNS scanner inspects common DNS records, including IPv4 and IPv6 addresses, CNAME, MX, NS, TXT, CAA, and SOA records. It also checks email security configuration, including SPF and DMARC, and inspects DNSSEC-related records.
+
+DNSSEC inspection reports the presence of relevant records; it does not perform cryptographic DNSSEC validation.
 
 ### TLS and certificate inspection
 
@@ -64,7 +66,20 @@ It also performs basic HTML-based SEO checks when the response contains supporte
 
 ## Python API
 
-Uspector exposes `TLSScanner` and `WebScanner` for use in Python applications.
+Uspector exposes `DNSScanner`, `TLSScanner`, and `WebScanner` for use in Python applications.
+
+### DNS scanning
+
+```python
+from uspector import DNSScanner
+
+scanner = DNSScanner()
+result = scanner.scan("example.com")
+
+print(result)
+```
+
+The DNS scanner returns structured information about DNS records, email security configuration, DNSSEC record presence, and detected findings.
 
 ### TLS scanning
 
@@ -88,9 +103,24 @@ result = scanner.scan("https://example.com")
 print(result)
 ```
 
-Both scanners return structured results that can be processed by other Python code, incorporated into diagnostic workflows, or serialized for reporting.
+All scanners return structured results that can be processed by other Python code, incorporated into diagnostic workflows, or serialized for reporting.
 
 ## Features
+
+### DNS diagnostics
+
+- IPv4 (A) and IPv6 (AAAA) record lookups
+- CNAME record inspection
+- Mail server (MX) and name server (NS) discovery
+- TXT record inspection, including important verification and SPF records
+- CAA record inspection
+- SOA record details, including primary nameserver, responsible party, and serial number
+- SPF and DMARC configuration checks
+- Optional DKIM record checks using a specified selector
+- DNSSEC-related record inspection, including DS, DNSKEY, and RRSIG
+- DNS findings and structured scan results
+
+DNSSEC records are inspected for presence; their cryptographic validity is not verified.
 
 ### SSL/TLS inspection
 
@@ -99,6 +129,7 @@ Both scanners return structured results that can be processed by other Python co
 - Certificate expiration checks
 - TLS version and cipher suite reporting
 - DNS resolution and IP address reporting
+- Certificate details, including subject, issuer, SAN, and fingerprint
 - Structured scan results and security findings
 
 ### Web security diagnostics
@@ -131,16 +162,20 @@ Depending on the scanner, results can include:
 
 | Result | Description |
 |---|---|
+| DNS records | Observed DNS records, including addresses, mail servers, and nameservers |
+| SPF / DMARC | Email security configuration checks |
+| DNSSEC records | Presence of DNSSEC-related records; not cryptographic validation |
 | Target | Hostname or URL being scanned |
 | Status code | HTTP response status, for web scans |
 | Final URL | Destination after redirects |
 | Resolved IPs | IP addresses resolved during scanning |
+| Certificate details | Certificate trust, hostname validity, expiration, and related properties |
 | Security headers | Observed HTTP security-header values |
 | Findings | Detected configuration concerns or indicators |
 | SEO | HTML and indexing-related diagnostics |
 | Error | Error information when a scan cannot complete |
 
-A reported missing security header is an observation, not proof that a website is vulnerable. Findings should be assessed according to the site's architecture, intended behavior, and security requirements.
+A reported missing DNS record or security header is an observation, not necessarily proof that a system is vulnerable. Findings should be assessed according to the domain's configuration, the site's architecture, intended behavior, and security requirements.
 
 ## Requirements
 
@@ -150,7 +185,7 @@ A reported missing security header is an observation, not proof that a website i
 
 ## Responsible Use
 
-Only scan systems and websites you own or are authorized to assess. TLS and web diagnostic results are informational and should be validated before making security decisions.
+Only scan systems and websites you own or are authorized to assess. DNS, TLS, and web diagnostic results are informational and should be validated before making security decisions.
 
 ## Project Structure
 
