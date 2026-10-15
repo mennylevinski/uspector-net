@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 
+from .dnsscanner import DNSScanner
 from .tlsscanner import TLSScanner
 from .webscanner import WebScanner
 
@@ -11,12 +12,37 @@ from .webscanner import WebScanner
 def main():
     parser = argparse.ArgumentParser(
         prog="uspector",
-        description="TLS inspection and passive web security diagnostics.",
+        description="DNS, TLS, and passive web security diagnostics.",
     )
 
     subparsers = parser.add_subparsers(
         dest="command",
         required=True,
+    )
+
+    # DNS scanner
+    dns_parser = subparsers.add_parser(
+        "dns",
+        help="Inspect DNS records, email security, and DNSSEC.",
+        description="Perform DNS security diagnostics.",
+    )
+    dns_parser.add_argument(
+        "hostname",
+        help="Hostname or domain to scan.",
+    )
+    dns_parser.add_argument(
+        "--dkim-selector",
+        help="DKIM selector to check (optional).",
+    )
+    dns_parser.add_argument(
+        "--no-dnssec",
+        action="store_true",
+        help="Skip DNSSEC inspection.",
+    )
+    dns_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output the complete result as JSON.",
     )
 
     # TLS scanner
@@ -75,7 +101,16 @@ def main():
     args = parser.parse_args()
 
     try:
-        if args.command == "tls":
+        if args.command == "dns":
+            scanner = DNSScanner()
+            result = scanner.scan(
+                args.hostname,
+                dkim_selector=args.dkim_selector,
+                include_dnssec=not args.no_dnssec,
+            )
+            title = f"Uspector DNS Scan: {args.hostname}"
+
+        elif args.command == "tls":
             scanner = TLSScanner(timeout=args.timeout)
             result = scanner.check_tls(args.hostname, args.port)
             title = f"Uspector TLS Scan: {args.hostname}:{args.port}"
@@ -88,14 +123,18 @@ def main():
         if args.json:
             print(json.dumps(result, indent=2, default=str))
         else:
-            print(title)
-            print("=" * 50)
+            if args.command == "dns":
+                print(scanner.format_scan(result))
 
-            if isinstance(result, dict):
-                for key, value in result.items():
-                    print(f"{key.replace('_', ' ').title()}: {value}")
             else:
-                print(result)
+                print(title)
+                print("=" * 50)
+
+                if isinstance(result, dict):
+                    for key, value in result.items():
+                        print(f"{key.replace('_', ' ').title()}: {value}")
+                else:
+                    print(result)
 
         if isinstance(result, dict) and result.get("error"):
             return 1

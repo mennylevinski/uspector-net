@@ -18,6 +18,7 @@ from cryptography.x509.oid import AuthorityInformationAccessOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
+
 # ====== TLS Scanner ======
 class TLSScanner:
     """Inspect TLS configuration and certificate information for a server."""

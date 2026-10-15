@@ -10,6 +10,7 @@ from html.parser import HTMLParser
 
 import requests
 
+
 class WebScanner:
     def __init__(self, timeout: float = 15.0):
         self.timeout = timeout
