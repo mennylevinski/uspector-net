@@ -1,3 +1,13 @@
+<a name="top"></a>
+
+<div align="center">
+
+  <a href="https://github.com/mennylevinski/uspector-net">
+    <img src="img/uspector-main-logo2.png" alt="Uspector TLS and Web Security Scanner logo" width="200" height="200">
+  </a>
+
+</div>
+
 # Uspector — SSL/TLS Security, DNS & Web Diagnostics
 
 Uspector is a Python library and command-line tool for SSL/TLS inspection, DNS diagnostics, certificate validation, and passive web security diagnostics.
