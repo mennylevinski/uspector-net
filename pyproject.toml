@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "uspector"
-version = "1.0.6"
+version = "1.0.7"
 description = "Python library for DNS, TLS, and passive web security diagnostics"
 readme = "README.md"
 requires-python = ">=3.10"

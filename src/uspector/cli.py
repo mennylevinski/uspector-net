@@ -4,6 +4,8 @@ import argparse
 import json
 import sys
 
+from importlib.metadata import version, PackageNotFoundError
+
 from .dnsscanner import DNSScanner
 from .tlsscanner import TLSScanner
 from .webscanner import WebScanner
@@ -13,6 +15,17 @@ def main():
     parser = argparse.ArgumentParser(
         prog="uspector",
         description="DNS, TLS, and passive web security diagnostics.",
+    )
+
+    try:
+        package_version = version("uspector")
+    except PackageNotFoundError:
+        package_version = "unknown"
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"Uspector {package_version}",
     )
 
     subparsers = parser.add_subparsers(
