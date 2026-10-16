@@ -136,18 +136,7 @@ def main():
         if args.json:
             print(json.dumps(result, indent=2, default=str))
         else:
-            if args.command == "dns":
-                print(scanner.format_scan(result))
-
-            else:
-                print(title)
-                print("=" * 50)
-
-                if isinstance(result, dict):
-                    for key, value in result.items():
-                        print(f"{key.replace('_', ' ').title()}: {value}")
-                else:
-                    print(result)
+            print(scanner.format_scan(result))
 
         if isinstance(result, dict) and result.get("error"):
             return 1

@@ -15,6 +15,120 @@ class WebScanner:
     def __init__(self, timeout: float = 15.0):
         self.timeout = timeout
 
+    @staticmethod
+    def format_scan(result: dict) -> str:
+        """Format web scan results for readable CLI output."""
+        lines = [
+            f"Uspector Web Scan: {result.get('target') or 'Unknown'}",
+            "=" * 50,
+            "",
+            "HTTP Overview:",
+        ]
+
+        if result.get("final_url"):
+            lines.append(f"  Final URL: {result['final_url']}")
+
+        status = result.get("status_code")
+        lines.append(
+            f"  Status Code: {status if status is not None else 'Unavailable'}"
+        )
+
+        ips = result.get("resolved_ips") or []
+        lines.append("  Resolved IPs:")
+        if ips:
+            lines.extend(f"    - {ip}" for ip in ips)
+        else:
+            lines.append("    None found")
+
+        if result.get("error"):
+            lines.append(f"  Error: {result['error']}")
+
+        # Security headers
+        lines.extend(["", "Security Headers:"])
+        headers = result.get("security_headers") or {}
+
+        if headers:
+            for name, value in headers.items():
+                lines.append(f"  {name}: {value if value else 'Not present'}")
+        else:
+            lines.append("  No header information available")
+
+        # Cookies
+        lines.extend(["", "Cookies:"])
+        cookies = result.get("cookies") or []
+
+        if cookies:
+            for cookie in cookies:
+                lines.append(f"  - {cookie.get('name', 'Unknown')}")
+                lines.append(
+                    f"      Secure: {'Yes' if cookie.get('secure') else 'No'}"
+                )
+                lines.append(
+                    f"      HttpOnly: {'Yes' if cookie.get('httponly') else 'No'}"
+                )
+                lines.append(
+                    f"      SameSite: {'Yes' if cookie.get('samesite') else 'No'}"
+                )
+        else:
+            lines.append("  None found")
+
+        # Response-body indicators
+        lines.extend(["", "Response Indicators:"])
+        indicators = result.get("body_indicators") or []
+
+        if indicators:
+            lines.extend(f"  - {item}" for item in indicators)
+        else:
+            lines.append("  None detected")
+
+        # SEO diagnostics
+        lines.extend(["", "SEO Diagnostics:"])
+        seo = result.get("seo")
+
+        if isinstance(seo, dict):
+            seo_fields = [
+                ("Title Length", "title_length"),
+                ("Meta Description", "has_meta_description"),
+                ("Meta Description Length", "meta_description_length"),
+                ("Canonical URL", "canonical_url"),
+                ("Meta Robots", "meta_robots"),
+                ("X-Robots-Tag", "x_robots_tag"),
+                ("H1 Count", "h1_count"),
+                ("HTML Language", "html_language"),
+                ("Image Count", "image_count"),
+                ("Images Missing Alt", "images_missing_alt"),
+                ("Open Graph Title", "has_og_title"),
+                ("Open Graph Description", "has_og_description"),
+            ]
+
+            for label, key in seo_fields:
+                value = seo.get(key)
+                if isinstance(value, bool):
+                    value = "Yes" if value else "No"
+                elif value is None or value == "":
+                    value = "Not found"
+                lines.append(f"  {label}: {value}")
+
+            seo_findings = seo.get("findings") or []
+            lines.append("  SEO Findings:")
+            if seo_findings:
+                lines.extend(f"    - {item}" for item in seo_findings)
+            else:
+                lines.append("    None")
+        else:
+            lines.append("  No HTML SEO data available")
+
+        # General findings
+        lines.extend(["", "Findings:"])
+        findings = result.get("findings") or []
+
+        if findings:
+            lines.extend(f"  - {item}" for item in findings)
+        else:
+            lines.append("  None")
+
+        return "\n".join(lines)
+
     def scan(self, target: str) -> dict:
         """Scan an HTTP(S) endpoint and return structured results."""
         result = {

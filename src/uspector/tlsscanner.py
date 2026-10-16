@@ -767,6 +767,152 @@ class TLSScanner:
 
         return result
 
+    # ====== Format Output ======
+    @staticmethod
+    def format_scan(result: dict) -> str:
+        """Format TLS scan results for readable CLI output."""
+        domain = result.get("domain", "Unknown")
+        port = result.get("port", 443)
+
+        lines = [
+            f"Uspector TLS Scan: {domain}:{port}",
+            "=" * 50,
+            "",
+            "TLS Overview:",
+            f"  Verdict: {result.get('verdict', 'INCONCLUSIVE')}",
+            f"  Connection Status: {result.get('connection_status', 'Unknown')}",
+            f"  Certificate Trusted: "
+            f"{'Yes' if result.get('certificate_trusted') else 'No'}",
+        ]
+
+        hostname_valid = result.get("hostname_valid")
+        if hostname_valid is not None:
+            lines.append(
+                "  Hostname Valid: "
+                + ("Yes" if hostname_valid else "No")
+            )
+        else:
+            lines.append("  Hostname Valid: Unknown")
+
+        # Connection details
+        lines.extend(["", "Connection:"])
+
+        if result.get("tls_version"):
+            lines.append(f"  Negotiated TLS Version: {result['tls_version']}")
+
+        cipher = result.get("cipher")
+        if cipher:
+            lines.append(f"  Cipher Suite: {cipher[0]}")
+            if len(cipher) > 1 and cipher[1]:
+                lines.append(f"  Cipher Protocol: {cipher[1]}")
+            if len(cipher) > 2 and cipher[2] is not None:
+                lines.append(f"  Cipher Bits: {cipher[2]}")
+
+        if result.get("alpn"):
+            lines.append(f"  ALPN: {result['alpn']}")
+
+        if result.get("latency_ms") is not None:
+            lines.append(f"  Latency: {result['latency_ms']} ms")
+
+        ips = result.get("resolved_ips") or []
+        lines.append("  Resolved IPs:")
+        if ips:
+            lines.extend(f"    - {ip}" for ip in ips)
+        else:
+            lines.append("    None found")
+
+        # Protocol support
+        lines.extend(["", "Supported TLS Versions:"])
+        versions = result.get("supported_tls_versions") or []
+        if versions:
+            lines.extend(f"  - {version}" for version in versions)
+        else:
+            lines.append("  No successful protocol probes")
+
+        # Certificate details
+        lines.extend(["", "Certificate:"])
+
+        certificate_fields = [
+            ("Subject", "subject"),
+            ("Issuer", "issuer"),
+            ("Fingerprint (SHA-256)", "fingerprint"),
+            ("Valid From", "not_before"),
+            ("Valid Until", "not_after"),
+            ("Days Remaining", "days_remaining"),
+            ("Public Key Type", "public_key_type"),
+            ("Public Key Bits", "public_key_bits"),
+        ]
+
+        for label, key in certificate_fields:
+            value = result.get(key)
+            if value is not None and value != "":
+                lines.append(f"  {label}: {value}")
+
+        if "self_signed" in result:
+            lines.append(
+                "  Subject Matches Issuer: "
+                + ("Yes" if result["self_signed"] else "No")
+            )
+
+        san = result.get("san") or []
+        if san:
+            lines.append("  Subject Alternative Names:")
+            lines.extend(f"    - {name}" for name in san)
+
+        san_ips = result.get("san_ip_addresses") or []
+        if san_ips:
+            lines.append("  SAN IP Addresses:")
+            lines.extend(f"    - {ip}" for ip in san_ips)
+
+        # Diagnostic handshake
+        diagnostic = result.get("diagnostic_handshake")
+        if diagnostic and diagnostic != "Not Attempted":
+            lines.extend([
+                "",
+                "Diagnostic Handshake:",
+                f"  Status: {diagnostic}",
+            ])
+
+        # OCSP
+        ocsp_result = result.get("ocsp")
+        if isinstance(ocsp_result, dict):
+            lines.extend(["", "OCSP:"])
+            lines.append(
+                f"  Status: {ocsp_result.get('status', 'Unknown')}"
+            )
+
+            if ocsp_result.get("url"):
+                lines.append(f"  Responder URL: {ocsp_result['url']}")
+
+            lines.append(
+                "  Response Validated: "
+                + (
+                    "Yes"
+                    if ocsp_result.get("response_validated")
+                    else "No"
+                )
+            )
+
+        # Errors
+        for label, key in (
+            ("Error", "error"),
+            ("TLS Error", "ssl_error"),
+            ("Diagnostic Error", "diagnostic_error"),
+        ):
+            if result.get(key):
+                lines.extend(["", f"{label}: {result[key]}"])
+
+        # Findings
+        lines.extend(["", "Findings:"])
+        findings = result.get("findings") or []
+
+        if findings:
+            lines.extend(f"  - {finding}" for finding in findings)
+        else:
+            lines.append("  None")
+
+        return "\n".join(lines)
+
     # ====== Certificate Validity ======
     @staticmethod
     def _check_certificate_validity(result, certificate):
