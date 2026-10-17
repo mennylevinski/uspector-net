@@ -50,7 +50,9 @@ jobs:
 
       - name: Test executable
         run: |
+          ./dist/linux/uspector --version
           ./dist/linux/uspector --help
+          ./dist/linux/uspector dns --help
           ./dist/linux/uspector tls --help
           ./dist/linux/uspector web --help
           file dist/linux/uspector
