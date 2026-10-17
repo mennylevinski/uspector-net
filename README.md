@@ -8,7 +8,7 @@
 
 </div>
 
-# Uspector — SSL/TLS Security, DNS & Web Diagnostics
+# Uspector – SSL/TLS Security, DNS & Web Diagnostics
 
 Uspector is a Python library and command-line tool for SSL/TLS inspection, DNS diagnostics, certificate validation, and passive web security diagnostics.
 
