@@ -3,7 +3,7 @@
 <div align="center">
 
   <a href="https://github.com/mennylevinski/uspector-net">
-    <img src="img/uspector-main-logo1.png" alt="Uspector TLS and Web Security Scanner logo" width="200" height="200">
+    <img src="img/uspector-main-logo-prod.png" alt="Uspector TLS and Web Security Scanner logo" width="200" height="200">
   </a>
 
 </div>
