@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "uspector"
-version = "1.0.8"
-description = "Python library for DNS, TLS, and passive web security diagnostics"
+version = "1.0.9"
+description = "Python library for DNS, TLS, web, and remote PHP security diagnostics"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

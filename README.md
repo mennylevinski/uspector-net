@@ -1,18 +1,18 @@
-<a name="top"></a>
+ <a name="top"></a>
 
 <div align="center">
 
   <a href="https://github.com/mennylevinski/uspector-net">
-    <img src="img/uspector-main-logo-prod.png" alt="Uspector TLS and Web Security Scanner logo" width="200" height="200">
+    <img src="img/uspector-main-logo-prod.png" alt="Uspector Security Diagnostics logo" width="200" height="200">
   </a>
 
 </div>
 
-# Uspector – SSL/TLS Security, DNS & Web Diagnostics
+# Uspector – DNS, SSL/TLS, Web & PHP Security Diagnostics
 
-Uspector is a Python library and command-line tool for SSL/TLS inspection, DNS diagnostics, certificate validation, and passive web security diagnostics.
+Uspector is a Python library and command-line tool for DNS diagnostics, SSL/TLS inspection, certificate validation, passive web security diagnostics, and remote PHP security checks.
 
-It helps developers and security professionals inspect TLS configurations, review certificate details, analyze important DNS records, and identify common web security and SEO configuration issues.
+It helps developers and security professionals inspect TLS configurations, review certificate details, analyze important DNS records, and identify common web security, PHP information disclosure, and SEO configuration issues.
 
 ## Installation
 
@@ -32,7 +32,7 @@ Requirements: Python 3.10 or later.
 
 ## Command-Line Interface
 
-Uspector provides separate commands for DNS diagnostics, TLS inspection, and web diagnostics.
+Uspector provides separate commands for DNS diagnostics, TLS inspection, web diagnostics, and remote PHP security checks.
 
 ### DNS diagnostics
 
@@ -52,6 +52,12 @@ Scan a hostname:
 
 ```bash
 uspector tls example.com
+```
+
+Specify a custom port:
+
+```bash
+uspector tls example.com -p 8443
 ```
 
 Use this to inspect TLS connectivity, certificate properties, hostname validation, certificate expiration, supported TLS versions, cipher suites, and other available connection diagnostics.
@@ -74,9 +80,38 @@ The web scanner follows HTTP redirects and reports information about the final U
 
 It also performs basic HTML-based SEO checks when the response contains supported HTML content.
 
+### Remote PHP security diagnostics
+
+Scan a website for PHP-related security indicators and information disclosure:
+
+```bash
+uspector php example.com
+```
+
+Specify a complete URL:
+
+```bash
+uspector php https://example.com
+```
+
+The PHP scanner performs remote HTTP-based checks for PHP technology detection, version disclosure, exposed PHP information pages, PHP error messages, publicly accessible configuration and backup files, and directory listing indicators.
+
+The scanner does not execute PHP code or directly inspect the server's PHP configuration. Detection depends on information exposed through HTTP responses.
+
+### JSON output
+
+All scanners support structured JSON output:
+
+```bash
+uspector dns example.com --json
+uspector tls example.com --json
+uspector web example.com --json
+uspector php example.com --json
+```
+
 ## Python API
 
-Uspector exposes `DNSScanner`, `TLSScanner`, and `WebScanner` for use in Python applications.
+Uspector exposes `DNSScanner`, `TLSScanner`, `WebScanner`, and `PHPScanner` for use in Python applications.
 
 ### DNS scanning
 
@@ -89,15 +124,13 @@ result = scanner.scan("example.com")
 print(result)
 ```
 
-The DNS scanner returns structured information about DNS records, email security configuration, DNSSEC record presence, and detected findings.
-
 ### TLS scanning
 
 ```python
 from uspector import TLSScanner
 
 scanner = TLSScanner()
-result = scanner.scan("example.com")
+result = scanner.check_tls("example.com", 443)
 
 print(result)
 ```
@@ -108,6 +141,17 @@ print(result)
 from uspector import WebScanner
 
 scanner = WebScanner()
+result = scanner.scan("https://example.com")
+
+print(result)
+```
+
+### PHP scanning
+
+```python
+from uspector import PHPScanner
+
+scanner = PHPScanner()
 result = scanner.scan("https://example.com")
 
 print(result)
@@ -150,6 +194,20 @@ DNSSEC records are inspected for presence; their cryptographic validity is not v
 - DNS resolution and resolved IP reporting
 - Detection of selected suspicious or error-related response-body indicators
 
+### PHP security diagnostics
+
+- Remote PHP technology detection
+- PHP version disclosure detection
+- Detection of publicly accessible `phpinfo()` pages
+- PHP warning, notice, fatal error, and stack trace indicators
+- Checks for publicly accessible PHP configuration and backup files
+- Checks for potentially exposed `.env` files
+- Composer manifest and lock-file exposure checks
+- PHP-related directory listing detection
+- Security findings with severity levels and remediation recommendations
+
+PHP checks are performed remotely through HTTP responses. The scanner cannot determine the actual PHP version or configuration when this information is not publicly disclosed. File exposure indicators should be interpreted in context and do not automatically indicate a vulnerability.
+
 ### SEO diagnostics
 
 - HTML title presence and length checks
@@ -176,16 +234,18 @@ Depending on the scanner, results can include:
 | SPF / DMARC | Email security configuration checks |
 | DNSSEC records | Presence of DNSSEC-related records; not cryptographic validation |
 | Target | Hostname or URL being scanned |
-| Status code | HTTP response status, for web scans |
+| Status code | HTTP response status, for web and PHP scans |
 | Final URL | Destination after redirects |
 | Resolved IPs | IP addresses resolved during scanning |
 | Certificate details | Certificate trust, hostname validity, expiration, and related properties |
 | Security headers | Observed HTTP security-header values |
+| PHP detection | PHP technology and version disclosure indicators |
+| Exposed files | Potentially accessible configuration, backup, and diagnostic files |
 | Findings | Detected configuration concerns or indicators |
 | SEO | HTML and indexing-related diagnostics |
 | Error | Error information when a scan cannot complete |
 
-A reported missing DNS record or security header is an observation, not necessarily proof that a system is vulnerable. Findings should be assessed according to the domain's configuration, the site's architecture, intended behavior, and security requirements.
+A reported missing DNS record, security header, or PHP indicator is an observation, not necessarily proof that a system is vulnerable. Findings should be assessed according to the domain's configuration, the site's architecture, intended behavior, and security requirements.
 
 ## Requirements
 
@@ -195,7 +255,11 @@ A reported missing DNS record or security header is an observation, not necessar
 
 ## Responsible Use
 
-Only scan systems and websites you own or are authorized to assess. DNS, TLS, and web diagnostic results are informational and should be validated before making security decisions.
+Only scan systems and websites you own or are authorized to assess.
+
+DNS, TLS, web, and PHP diagnostic results are informational and should be validated before making security decisions.
+
+The remote PHP scanner performs HTTP-based inspection only. It does not execute PHP code, modify remote files, or attempt to exploit vulnerabilities.
 
 ## Project Structure
 
@@ -203,7 +267,12 @@ Only scan systems and websites you own or are authorized to assess. DNS, TLS, an
 uspector-net/
 ├── img/                  # Logo and media assets
 ├── src/
-│   └── uspector/         # Python package source code
+│   └── uspector/
+│       ├── dnsscanner.py # DNS diagnostics
+│       ├── tlsscanner.py # TLS inspection
+│       ├── webscanner.py # Web security and SEO diagnostics
+│       ├── phpscanner.py # Remote PHP security diagnostics
+│       └── cli.py        # Command-line interface
 ├── tests/                # Automated tests
 ├── LICENSE               # MIT License
 ├── README.md             # Project documentation

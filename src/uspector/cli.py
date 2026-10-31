@@ -9,12 +9,13 @@ from importlib.metadata import version, PackageNotFoundError
 from .dnsscanner import DNSScanner
 from .tlsscanner import TLSScanner
 from .webscanner import WebScanner
+from .phpscanner import PHPScanner
 
 
 def main():
     parser = argparse.ArgumentParser(
         prog="uspector",
-        description="DNS, TLS, and passive web security diagnostics.",
+        description="DNS, TLS, web, and remote PHP security diagnostics.",
     )
 
     try:
@@ -88,6 +89,29 @@ def main():
         help="Output the complete result as JSON.",
     )
 
+        # PHP scanner
+    php_parser = subparsers.add_parser(
+        "php",
+        help="Inspect remote PHP security and information disclosure.",
+        description="Perform remote PHP security diagnostics.",
+    )
+    php_parser.add_argument(
+        "target",
+        help="Target URL or hostname.",
+    )
+    php_parser.add_argument(
+        "-t",
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="HTTP timeout in seconds (default: 10).",
+    )
+    php_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output the complete result as JSON.",
+    )
+
     # Web scanner
     web_parser = subparsers.add_parser(
         "web",
@@ -128,10 +152,15 @@ def main():
             result = scanner.check_tls(args.hostname, args.port)
             title = f"Uspector TLS Scan: {args.hostname}:{args.port}"
 
-        else:
+        elif args.command == "web":
             scanner = WebScanner(timeout=args.timeout)
             result = scanner.scan(args.target)
             title = f"Uspector Web Scan: {args.target}"
+
+        elif args.command == "php":
+            scanner = PHPScanner(timeout=args.timeout)
+            result = scanner.scan(args.target)
+            title = f"Uspector PHP Scan: {args.target}"
 
         if args.json:
             print(json.dumps(result, indent=2, default=str))
