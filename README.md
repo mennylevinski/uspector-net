@@ -42,9 +42,15 @@ Scan a domain:
 uspector dns example.com
 ```
 
-The DNS scanner inspects common DNS records, including IPv4 and IPv6 addresses, CNAME, MX, NS, TXT, CAA, and SOA records. It also checks email security configuration, including SPF and DMARC, and inspects DNSSEC-related records.
+Check a DKIM selector or skip DNSSEC record lookups:
 
-DNSSEC inspection reports the presence of relevant records; it does not perform cryptographic DNSSEC validation.
+```bash
+uspector dns example.com --dkim-selector default --no-dnssec
+```
+
+The DNS scanner inspects common DNS records (`A`, `AAAA`, `CNAME`, `MX`, `NS`, `TXT`, `CAA`, and `SOA`), evaluates SPF/DMARC/DKIM/CAA/NS/SOA hygiene, detects Null MX (`0 .`), and inspects DNSSEC-related records (`DS`, `DNSKEY`, `RRSIG`).
+
+DNSSEC inspection checks record presence, deprecated `DNSKEY` algorithms, and `RRSIG` expiration; it does not perform cryptographic DNSSEC chain validation.
 
 ### TLS and certificate inspection
 
@@ -54,13 +60,13 @@ Scan a hostname:
 uspector tls example.com
 ```
 
-Specify a custom port:
+Specify a custom port or connection timeout:
 
 ```bash
-uspector tls example.com -p 8443
+uspector tls example.com -p 8443 -t 10
 ```
 
-Use this to inspect TLS connectivity, certificate properties, hostname validation, certificate expiration, supported TLS versions, cipher suites, and other available connection diagnostics.
+Use this to inspect TLS connectivity, certificate properties, hostname/SAN validation, certificate expiration and hygiene, intermediate chain quality, OCSP status/validation, supported TLS versions (`TLSv1.0`–`TLSv1.3`), cipher suites, and connection diagnostics.
 
 ### Web security and SEO diagnostics
 
@@ -70,15 +76,13 @@ Scan a website:
 uspector web example.com
 ```
 
-Specify a complete URL when needed:
+Specify a complete URL and custom timeout when needed:
 
 ```bash
-uspector web https://example.com
+uspector web https://example.com -t 10
 ```
 
-The web scanner follows HTTP redirects and reports information about the final URL, HTTP status, resolved IP addresses, security headers, cookies, and selected response-body indicators.
-
-It also performs basic HTML-based SEO checks when the response contains supported HTML content.
+The web scanner follows HTTP redirects and reports the final URL, HTTP status, resolved IP addresses, security headers and directive quality, cookie attributes across redirects, passive client-side/HTML/body security indicators, and on-page SEO diagnostics.
 
 ### Remote PHP security diagnostics
 
@@ -88,17 +92,17 @@ Scan a website for PHP-related security indicators and information disclosure:
 uspector php example.com
 ```
 
-Specify a complete URL:
+Specify a complete URL and custom timeout:
 
 ```bash
-uspector php https://example.com
+uspector php https://example.com -t 15
 ```
 
-The PHP scanner performs remote HTTP-based checks for PHP technology detection, version disclosure, exposed PHP information pages, PHP error messages, publicly accessible configuration and backup files, and directory listing indicators.
+The PHP scanner performs passive, remote HTTP-based checks for PHP technology and framework detection, version and EOL lifecycle disclosure, PHP session cookie attributes, exposed `phpinfo()` pages, PHP error messages, publicly accessible configuration and backup files, and directory listing indicators.
 
-The scanner does not execute PHP code or directly inspect the server's PHP configuration. Detection depends on information exposed through HTTP responses.
+The scanner does not execute PHP code or directly inspect the server's PHP configuration. Detection depends on information exposed through HTTP responses, and non-global/localhost targets are blocked.
 
-### JSON output
+### JSON output & exit codes
 
 All scanners support structured JSON output:
 
@@ -108,6 +112,12 @@ uspector tls example.com --json
 uspector web example.com --json
 uspector php example.com --json
 ```
+
+CLI exit codes:
+
+- `0`: Scan completed successfully
+- `1`: Scan error, complete TLS handshake failure, or all DNS record queries failed
+- `2`: Invalid CLI input or argument type
 
 ## Python API
 
@@ -119,18 +129,25 @@ Uspector exposes `DNSScanner`, `TLSScanner`, `WebScanner`, and `PHPScanner` for 
 from uspector import DNSScanner
 
 scanner = DNSScanner()
-result = scanner.scan("example.com")
+result = scanner.scan("example.com", dkim_selector="default", check_extended=True)
 
 print(result)
 ```
+
+`check_extended=True` enables optional lookups for `MTA-STS`, `TLS-RPT`, `BIMI`, `TLSA` (`DANE`), `HTTPS`, `SVCB`, `NSEC`/`NSEC3`, dangling `CNAME` targets, and `FCrDNS`.
 
 ### TLS scanning
 
 ```python
 from uspector import TLSScanner
 
-scanner = TLSScanner()
-result = scanner.check_tls("example.com", 443)
+scanner = TLSScanner(timeout=5.0)
+result = scanner.check_tls(
+    "example.com",
+    443,
+    probe_weak_ciphers=False,
+    starttls=None,  # Optional: "smtp", "imap", or "ftp"
+)
 
 print(result)
 ```
@@ -140,7 +157,9 @@ print(result)
 ```python
 from uspector import WebScanner
 
-scanner = WebScanner()
+# Set allow_private=False to block localhost/private-IP targets and redirects.
+# Set check_metadata=True to also inspect security.txt, robots.txt, and HTTPS redirects.
+scanner = WebScanner(timeout=15.0, allow_private=True, check_metadata=False)
 result = scanner.scan("https://example.com")
 
 print(result)
@@ -151,7 +170,7 @@ print(result)
 ```python
 from uspector import PHPScanner
 
-scanner = PHPScanner()
+scanner = PHPScanner(timeout=10.0)
 result = scanner.scan("https://example.com")
 
 print(result)
@@ -163,60 +182,61 @@ All scanners return structured results that can be processed by other Python cod
 
 ### DNS diagnostics
 
-- IPv4 (A) and IPv6 (AAAA) record lookups
-- CNAME record inspection
-- Mail server (MX) and name server (NS) discovery
-- TXT record inspection, including important verification and SPF records
-- CAA record inspection
-- SOA record details, including primary nameserver, responsible party, and serial number
-- SPF and DMARC configuration checks
-- Optional DKIM record checks using a specified selector
-- DNSSEC-related record inspection, including DS, DNSKEY, and RRSIG
-- DNS findings and structured scan results
+- IPv4 (`A`) and IPv6 (`AAAA`) record lookups
+- `CNAME` record inspection (with `A`/`AAAA` fallback deduplication and optional dangling `NXDOMAIN` check)
+- Mail server (`MX`) and name server (`NS`) discovery, redundancy checks, IP-literal detection, and Null MX (`0 .`) awareness
+- `TXT` record inspection, including verification, `SPF`, `DMARC`, and `DKIM` records
+- `SPF` policy checks (`+all`/`?all`, deprecated `ptr`, missing terminator, and 10-DNS-lookup limit)
+- `DMARC` policy and tag checks (`p`, `sp`, `pct`, `rua`/`ruf`)
+- Optional `DKIM` selector checks (presence, revoked `p=`, test mode `t=y`, and RSA key bit-length)
+- `CAA` record and tag inspection (`issue`, `issuewild`, `iodef`)
+- `SOA` record details and timer sanity checks
+- `DNSSEC`-related inspection (`DS`, `DNSKEY` deprecated algorithms, `RRSIG` expiration)
+- Optional extended checks (`MTA-STS`, `TLS-RPT`, `BIMI`, `TLSA`, `HTTPS`, `SVCB`, `NSEC`/`NSEC3`, and `FCrDNS`)
 
-DNSSEC records are inspected for presence; their cryptographic validity is not verified.
+DNSSEC records are inspected for presence, algorithm hygiene, and signature expiration; full cryptographic chain validation is not performed.
 
 ### SSL/TLS inspection
 
-- TLS connection testing and diagnostics
-- Certificate trust and hostname validation
-- Certificate expiration checks
-- TLS version and cipher suite reporting
-- DNS resolution and IP address reporting
-- Certificate details, including subject, issuer, SAN, and fingerprint
-- Structured scan results and security findings
+- TLS connection testing and fallback diagnostic handshakes (plus optional `STARTTLS` for `smtp`, `imap`, `ftp`)
+- Certificate trust, SAN hostname/IP validation, and single-label wildcard rejection
+- Certificate expiration, validity span (`> 398` days), signature hash (`MD5`/`SHA1`), `BasicConstraints`, `ExtendedKeyUsage`, embedded SCT presence, and CRL distribution points
+- Intermediate certificate chain completeness (Python 3.13+) and intermediate key/expiry/signature hygiene
+- OCSP revocation queries with CertID, freshness, and cryptographic signature validation (with SSRF-guarded AIA `caIssuers` fallback)
+- Supported TLS version probing (`TLSv1.0`–`TLSv1.3`), weak/non-PFS cipher suite detection, and optional weak-cipher probing (`probe_weak_ciphers=True`)
+- DNS resolution, connected peer IP, ALPN, and structured findings/verdict
 
 ### Web security diagnostics
 
-- HTTP response status and redirect destination
-- HTTP security-header inspection
-- Cookie security-attribute checks, including `Secure`, `HttpOnly`, and `SameSite`
-- DNS resolution and resolved IP reporting
-- Detection of selected suspicious or error-related response-body indicators
+- HTTP response status, redirect chain cookies, and final destination (with optional `allow_private=False` SSRF protection)
+- Security-header presence and directive auditing (`Content-Security-Policy` & `Report-Only`, `Strict-Transport-Security` `max-age`/`includeSubDomains`, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`)
+- Cross-origin isolation header observation (`COOP`, `COEP`, `CORP`, `X-Permitted-Cross-Domain-Policies`), passive CORS (`*` + credentials), `Cache-Control` on cookie-setting responses, and server version banner checks
+- Cookie security-attribute checks across redirects (`Secure`, `HttpOnly`, and valid `SameSite` values)
+- Passive HTML and body security checks: mixed content, missing Subresource Integrity (`SRI`), `target="_blank"` without `noopener`/`noreferrer`, insecure password forms, source map references, internal IP leaks in URLs/comments, and framework error/stack-trace indicators
+- Optional metadata checks (`check_metadata=True`): `/.well-known/security.txt`, `/robots.txt` sensitive `Disallow:` entries, and HTTP-to-HTTPS redirect enforcement
 
 ### PHP security diagnostics
 
-- Remote PHP technology detection
-- PHP version disclosure detection
-- Detection of publicly accessible `phpinfo()` pages
-- PHP warning, notice, fatal error, and stack trace indicators
-- Checks for publicly accessible PHP configuration and backup files
-- Checks for potentially exposed `.env` files
-- Composer manifest and lock-file exposure checks
+- Remote PHP technology and passive framework detection (`Laravel`, `CakePHP`, `Symfony`, `WordPress`, `Drupal`, `Joomla`, `Magento`, `TYPO3`)
+- PHP version disclosure and end-of-life (EOL) branch detection
+- PHP and framework session cookie attribute checks (`PHPSESSID`, `laravel_session`, `CAKEPHP`, `SYMFONY`)
+- Detection of publicly accessible `phpinfo()` pages (main page and common filenames)
+- Expanded PHP warning, notice, fatal/deprecated error, `PDOException`/`SQLSTATE`, and Ignition/Whoops stack-trace indicators
+- Content-verified checks for publicly accessible backup, `.env`, `php.ini`, `.user.ini`, and `composer.json`/`composer.lock` files (including risky `php.ini`/`.user.ini` directives and exposed `require-dev` metadata)
 - PHP-related directory listing detection
-- Security findings with severity levels and remediation recommendations
+- Security findings with severity levels, remediation recommendations, and overall risk verdict
 
-PHP checks are performed remotely through HTTP responses. The scanner cannot determine the actual PHP version or configuration when this information is not publicly disclosed. File exposure indicators should be interpreted in context and do not automatically indicate a vulnerability.
+PHP checks are performed remotely through HTTP responses against publicly routable hosts. The scanner cannot determine the actual PHP version or configuration when this information is not publicly disclosed. File exposure indicators should be interpreted in context and do not automatically indicate a vulnerability.
 
 ### SEO diagnostics
 
-- HTML title presence and length checks
+- HTML title presence and length checks (ignoring inline SVG `<title>` elements)
 - Meta description presence and length checks
 - Canonical URL detection
 - Meta robots and `X-Robots-Tag` inspection
 - H1 heading count
 - HTML language attribute detection
-- Image alternative-text checks
+- Image alternative-text checks (distinguishing missing `alt` attributes from decorative `alt=""`)
 - Open Graph title and description presence
 - Detection of `noindex` directives
 
@@ -230,19 +250,21 @@ Depending on the scanner, results can include:
 
 | Result | Description |
 |---|---|
-| DNS records | Observed DNS records, including addresses, mail servers, and nameservers |
-| SPF / DMARC | Email security configuration checks |
-| DNSSEC records | Presence of DNSSEC-related records; not cryptographic validation |
+| DNS records | Observed DNS records (`A`, `AAAA`, `CNAME`, `MX`, `NS`, `TXT`, `CAA`, `SOA`, etc.) |
+| Email security | `SPF`, `DMARC`, `DKIM`, Null MX, and optional `MTA-STS`/`TLS-RPT`/`BIMI` checks |
+| DNSSEC records | Presence, algorithm hygiene, and `RRSIG` expiry inspection; not full validation |
 | Target | Hostname or URL being scanned |
-| Status code | HTTP response status, for web and PHP scans |
-| Final URL | Destination after redirects |
-| Resolved IPs | IP addresses resolved during scanning |
-| Certificate details | Certificate trust, hostname validity, expiration, and related properties |
-| Security headers | Observed HTTP security-header values |
-| PHP detection | PHP technology and version disclosure indicators |
-| Exposed files | Potentially accessible configuration, backup, and diagnostic files |
+| Status code | HTTP response status (top-level for web scans; per-file inside `exposed_files` for PHP scans) |
+| Final URL | Destination after redirects (web scans) |
+| Resolved IPs | IP addresses resolved during scanning (TLS and web scans) |
+| Certificate details | Trust, hostname validity, expiration, signature/chain hygiene, and SAN properties |
+| OCSP | Responder URL, unvalidated or cryptographically validated revocation status |
+| Security headers | Observed HTTP security-header values (web scans) |
+| PHP detection | PHP technology, framework, version disclosure, and EOL indicators |
+| Exposed files | Potentially accessible configuration, backup, and diagnostic files (PHP scans) |
 | Findings | Detected configuration concerns or indicators |
-| SEO | HTML and indexing-related diagnostics |
+| Verdict | Overall scan summary (`TLSScanner` and `PHPScanner`) |
+| SEO | HTML and indexing-related diagnostics (web scans) |
 | Error | Error information when a scan cannot complete |
 
 A reported missing DNS record, security header, or PHP indicator is an observation, not necessarily proof that a system is vulnerable. Findings should be assessed according to the domain's configuration, the site's architecture, intended behavior, and security requirements.
@@ -268,6 +290,7 @@ uspector-net/
 ├── img/                  # Logo and media assets
 ├── src/
 │   └── uspector/
+│       ├── _http.py      # Shared HTTP/cookie/SSRF helpers
 │       ├── dnsscanner.py # DNS diagnostics
 │       ├── tlsscanner.py # TLS inspection
 │       ├── webscanner.py # Web security and SEO diagnostics
