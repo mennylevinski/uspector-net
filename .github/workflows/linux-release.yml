@@ -27,6 +27,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install . requests pyinstaller
 
+      - name: Run unit tests
+        run: |
+          PYTHONPATH=src python -m unittest discover -s tests -v
+
       - name: Create build entry point
         run: |
           cat > uspector_entry.py <<'PY'
@@ -55,6 +59,7 @@ jobs:
           ./dist/linux/uspector dns --help
           ./dist/linux/uspector tls --help
           ./dist/linux/uspector web --help
+          ./dist/linux/uspector php --help
           file dist/linux/uspector
 
       - name: Upload Linux executable

@@ -6,17 +6,20 @@ import math
 import socket
 import ssl
 import time
-import urllib.error
-import urllib.request
 import warnings
 
 from datetime import datetime, timezone
+from urllib.parse import urljoin, urlparse
+
+import requests
 
 from cryptography import x509
 from cryptography.x509 import ocsp
 from cryptography.x509.oid import AuthorityInformationAccessOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
+
+from ._http import PinnedIPAdapter, validate_public_http_url
 
 
 # ====== TLS Scanner ======
@@ -146,12 +149,92 @@ class TLSScanner:
                 suffix = name[2:]
 
                 if (
-                    domain.endswith("." + suffix)
+                    "." in suffix
+                    and not suffix.startswith(".")
+                    and domain.endswith("." + suffix)
                     and domain.count(".") == suffix.count(".") + 1
                 ):
                     return True
 
         return False
+
+    @staticmethod
+    def _is_ip_literal(domain):
+        try:
+            ipaddress.ip_address(domain)
+            return True
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _validate_public_http_url(url):
+        return validate_public_http_url(
+            url,
+            error_prefix="AIA URL",
+            resolver=socket.getaddrinfo,
+        )
+
+    def _fetch_public_http_bytes(
+        self,
+        url,
+        method="GET",
+        data=None,
+        headers=None,
+        max_bytes=1_000_000,
+    ):
+        current_url = url
+        pinned_ips = {}
+
+        with requests.Session() as session:
+            session.trust_env = False
+            adapter = PinnedIPAdapter(pinned_ips)
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+
+            for _ in range(4):
+                host, port, dest_ip = self._validate_public_http_url(current_url)
+                pinned_ips[(host, port)] = dest_ip
+
+                response = session.request(
+                    method=method,
+                    url=current_url,
+                    data=data if method == "POST" else None,
+                    headers=headers,
+                    timeout=self.timeout,
+                    allow_redirects=False,
+                    stream=True,
+                    verify=True,
+                )
+
+                try:
+                    if response.is_redirect or response.is_permanent_redirect:
+                        location = response.headers.get("Location")
+                        if not location:
+                            raise ValueError("Redirect without Location header.")
+                        current_url = urljoin(current_url, location)
+                        if method == "POST" and response.status_code in (301, 302, 303):
+                            method = "GET"
+                            data = None
+                        continue
+
+                    response.raise_for_status()
+
+                    content = bytearray()
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if not chunk:
+                            continue
+                        remaining = (max_bytes + 1) - len(content)
+                        if remaining <= 0:
+                            break
+                        content.extend(chunk[:remaining])
+                        if len(content) > max_bytes:
+                            break
+
+                    return bytes(content)
+                finally:
+                    response.close()
+
+        raise ValueError("Too many redirects while querying AIA URL.")
 
     # ====== Certificate Chain ======
     def _get_certificate_chain(self, tls_sock, leaf_certificate):
@@ -209,6 +292,9 @@ class TLSScanner:
             result["status"] = "Certificate Unavailable"
             return result
 
+        aia = None
+        ca_issuers_urls = []
+
         try:
             aia = certificate.extensions.get_extension_for_class(
                 x509.AuthorityInformationAccess
@@ -221,9 +307,17 @@ class TLSScanner:
                         access.access_location,
                         x509.UniformResourceIdentifier,
                     )
+                    and not result["url"]
                 ):
                     result["url"] = access.access_location.value
-                    break
+                elif (
+                    access.access_method == AuthorityInformationAccessOID.CA_ISSUERS
+                    and isinstance(
+                        access.access_location,
+                        x509.UniformResourceIdentifier,
+                    )
+                ):
+                    ca_issuers_urls.append(access.access_location.value)
 
         except x509.ExtensionNotFound:
             result["status"] = "URL Not Available"
@@ -249,6 +343,34 @@ class TLSScanner:
                 issuer = candidate
                 break
 
+        # Fallback for Python <3.13 (no get_unverified_chain) or incomplete server chains.
+        if issuer is None:
+            for ca_url in ca_issuers_urls:
+                try:
+                    issuer_bytes = self._fetch_public_http_bytes(
+                        ca_url,
+                        method="GET",
+                        headers={"Accept": "application/pkix-cert,application/x-x509-ca-cert,*/*"},
+                    )
+                    if len(issuer_bytes) > 1_000_000:
+                        continue
+                    candidate = self._to_x509_certificate(issuer_bytes)
+                    if (
+                        candidate.fingerprint(hashes.SHA256()) != certificate_fingerprint
+                        and candidate.subject == certificate.issuer
+                    ):
+                        issuer = candidate
+                        break
+                except (
+                    requests.RequestException,
+                    TimeoutError,
+                    OSError,
+                    ValueError,
+                    TypeError,
+                    ssl.SSLError,
+                ):
+                    continue
+
         if issuer is None:
             result["status"] = "Issuer Certificate Unavailable"
             return result
@@ -262,21 +384,15 @@ class TLSScanner:
 
             request_data = request.public_bytes(serialization.Encoding.DER)
 
-            http_request = urllib.request.Request(
+            response_data = self._fetch_public_http_bytes(
                 result["url"],
+                method="POST",
                 data=request_data,
                 headers={
                     "Content-Type": "application/ocsp-request",
                     "Accept": "application/ocsp-response",
                 },
-                method="POST",
             )
-
-            with urllib.request.urlopen(
-                http_request,
-                timeout=self.timeout,
-            ) as response:
-                response_data = response.read(1_000_001)
 
             if len(response_data) > 1_000_000:
                 result["status"] = "Response Too Large"
@@ -307,11 +423,16 @@ class TLSScanner:
             else:
                 result["status"] = "REPORTED_UNKNOWN_UNVALIDATED"
 
+        except ValueError as exc:
+            if "private or restricted" in str(exc) or "localhost" in str(exc) or "scheme" in str(exc).lower():
+                result["status"] = "Blocked Non-Public URL"
+            else:
+                result["status"] = "Unavailable"
+
         except (
-            urllib.error.URLError,
+            requests.RequestException,
             TimeoutError,
             OSError,
-            ValueError,
             ssl.SSLError,
         ):
             result["status"] = "Unavailable"
@@ -322,18 +443,22 @@ class TLSScanner:
         return result
 
     # ====== TLS Connection Inspection ======
-    def _inspect_connection(self, domain, port, context):
+    def _inspect_connection(self, domain, port, context, connect_host=None):
         """Open a TLS connection and collect certificate details."""
 
+        target_host = connect_host or domain
+        is_ip = self._is_ip_literal(domain)
+        server_hostname = None if is_ip else domain
+
         raw_sock = socket.create_connection(
-            (domain, port),
+            (target_host, port),
             timeout=self.timeout,
         )
 
         try:
             with context.wrap_socket(
                 raw_sock,
-                server_hostname=domain,
+                server_hostname=server_hostname,
             ) as tls_sock:
                 cert_der = tls_sock.getpeercert(binary_form=True)
 
@@ -343,6 +468,11 @@ class TLSScanner:
                     )
 
                 certificate = x509.load_der_x509_certificate(cert_der)
+
+                try:
+                    peer_ip = tls_sock.getpeername()[0]
+                except OSError:
+                    peer_ip = target_host
 
                 return {
                     "tls_version": tls_sock.version(),
@@ -354,6 +484,7 @@ class TLSScanner:
                         certificate,
                     ),
                     "fingerprint": hashlib.sha256(cert_der).hexdigest().upper(),
+                    "peer_ip": peer_ip,
                 }
 
         finally:
@@ -363,7 +494,7 @@ class TLSScanner:
                 pass
 
     # ====== TLS Protocol Support ======
-    def _check_tls_protocol_support(self, domain, port=443):
+    def _check_tls_protocol_support(self, domain, port=443, connect_host=None):
         """
         Probe TLS 1.0 through TLS 1.3.
 
@@ -372,6 +503,8 @@ class TLSScanner:
         """
 
         supported_versions = []
+        target_host = connect_host or domain
+        server_hostname = None if self._is_ip_literal(domain) else domain
 
         versions = [
             ("TLSv1.0", ssl.TLSVersion.TLSv1, "TLSv1"),
@@ -400,13 +533,13 @@ class TLSScanner:
                     context.set_ciphers("DEFAULT:@SECLEVEL=0")
 
                 raw_sock = socket.create_connection(
-                    (domain, port),
+                    (target_host, port),
                     timeout=self.timeout,
                 )
 
                 with context.wrap_socket(
                     raw_sock,
-                    server_hostname=domain,
+                    server_hostname=server_hostname,
                 ) as tls_sock:
                     negotiated = tls_sock.version()
 
@@ -473,16 +606,53 @@ class TLSScanner:
             result["error"] = "DNS returned no usable addresses"
             return result
 
+        is_ip = self._is_ip_literal(domain)
+
         # Standard TLS connection with certificate verification.
         context = ssl.create_default_context()
-        context.check_hostname = True
+        context.check_hostname = not is_ip
         context.verify_mode = ssl.CERT_REQUIRED
         context.set_alpn_protocols(["h2", "http/1.1"])
 
         start_time = time.perf_counter()
+        connected_ip = None
+
+        def _connect_with_resolved_ips(tls_context, preferred_ip=None):
+            candidates = (
+                [preferred_ip]
+                if preferred_ip
+                else result["resolved_ips"]
+            )
+            last_os_error = None
+            for ip_addr in candidates:
+                try:
+                    return self._inspect_connection(
+                        domain,
+                        port,
+                        tls_context,
+                        connect_host=ip_addr,
+                    )
+                except ssl.SSLError:
+                    raise
+                except OSError as os_exc:
+                    last_os_error = os_exc
+                    continue
+            if last_os_error is not None:
+                raise last_os_error
+            raise OSError("No resolved IP addresses available")
 
         try:
-            inspected = self._inspect_connection(domain, port, context)
+            inspected = _connect_with_resolved_ips(context)
+            connected_ip = inspected.get("peer_ip", connected_ip)
+            result["connected_ip"] = connected_ip
+
+            if is_ip and not self._certificate_hostname_matches(
+                inspected["certificate_obj"],
+                domain,
+            ):
+                raise ssl.SSLCertVerificationError(
+                    "IP address mismatch: certificate is not valid for this IP"
+                )
 
             result.update({
                 "connection_status": "Passed",
@@ -542,11 +712,12 @@ class TLSScanner:
             diagnostic_context.set_alpn_protocols(["h2", "http/1.1"])
 
             try:
-                inspected = self._inspect_connection(
-                    domain,
-                    port,
+                inspected = _connect_with_resolved_ips(
                     diagnostic_context,
+                    preferred_ip=connected_ip,
                 )
+                connected_ip = inspected.get("peer_ip", connected_ip)
+                result["connected_ip"] = connected_ip
 
                 result.update({
                     "diagnostic_handshake": "Passed",
@@ -584,11 +755,12 @@ class TLSScanner:
                     warnings.simplefilter("ignore", DeprecationWarning)
                     diagnostic_context.minimum_version = ssl.TLSVersion.TLSv1
 
-                inspected = self._inspect_connection(
-                    domain,
-                    port,
+                inspected = _connect_with_resolved_ips(
                     diagnostic_context,
+                    preferred_ip=connected_ip,
                 )
+                connected_ip = inspected.get("peer_ip", connected_ip)
+                result["connected_ip"] = connected_ip
 
                 result.update({
                     "diagnostic_handshake": "Passed",
@@ -697,7 +869,11 @@ class TLSScanner:
                 certificate.subject == certificate.issuer
             )
 
-            if result["self_signed"]:
+            if (
+                result["self_signed"]
+                and "TLS certificate is self-signed and not trusted"
+                not in result["findings"]
+            ):
                 result["findings"].append(
                     "Certificate subject and issuer are identical"
                 )
@@ -717,7 +893,11 @@ class TLSScanner:
 
         # Probe TLS versions. Failed probes do not prove versions are disabled.
         result["supported_tls_versions"] = (
-            self._check_tls_protocol_support(domain, port)
+            self._check_tls_protocol_support(
+                domain,
+                port,
+                connect_host=connected_ip or result["resolved_ips"][0],
+            )
         )
 
         supported_versions = result["supported_tls_versions"]
@@ -756,11 +936,15 @@ class TLSScanner:
             else:
                 result["verdict"] = "SECURE"
 
-        elif (
-            result["diagnostic_handshake"] == "Passed"
-            and result["findings"]
-        ):
-            result["verdict"] = "WARNING"
+        elif result["diagnostic_handshake"] == "Passed":
+            if (
+                not result["certificate_trusted"]
+                or result["hostname_valid"] is False
+                or result["findings"]
+            ):
+                result["verdict"] = "WARNING"
+            else:
+                result["verdict"] = "INCONCLUSIVE"
 
         else:
             result["verdict"] = "INCONCLUSIVE"

@@ -44,16 +44,18 @@ class DNSScanner:
         self.timeout = max(0.1, float(timeout))
         self.retries = max(1, int(retries))
         self.port = int(port)
-        self.nameservers = list(nameservers or self._discover_nameservers())
 
-        if not self.nameservers:
-            self.nameservers = ["1.1.1.1"]
+        if nameservers is None:
+            self.nameservers = self._discover_nameservers() or ["1.1.1.1"]
+        else:
+            self.nameservers = list(nameservers)
 
         self.nameservers = list(dict.fromkeys(self.nameservers))
 
     @staticmethod
     def _discover_nameservers() -> list[str]:
         """Discover configured DNS resolvers without external dependencies."""
+        active_found: list[str] = []
         found: list[str] = []
 
         if os.name == "nt":
@@ -82,6 +84,7 @@ class DNSScanner:
                             with winreg.OpenKey(
                                 root, interface_name
                             ) as interface:
+                                interface_dns: list[str] = []
                                 for value_name in (
                                     "NameServer", "DhcpNameServer"
                                 ):
@@ -93,11 +96,44 @@ class DNSScanner:
                                         continue
 
                                     if isinstance(value, str):
-                                        found.extend(
+                                        interface_dns.extend(
                                             value.replace(",", " ")
                                             .replace(";", " ")
                                             .split()
                                         )
+
+                                if not interface_dns:
+                                    continue
+
+                                found.extend(interface_dns)
+
+                                is_active = False
+                                for ip_value_name in (
+                                    "IPAddress", "DhcpIPAddress"
+                                ):
+                                    try:
+                                        ip_val, _ = winreg.QueryValueEx(
+                                            interface, ip_value_name
+                                        )
+                                    except OSError:
+                                        continue
+
+                                    ips = (
+                                        ip_val
+                                        if isinstance(ip_val, list)
+                                        else [ip_val]
+                                        if isinstance(ip_val, str)
+                                        else []
+                                    )
+                                    if any(
+                                        item and item != "0.0.0.0"
+                                        for item in ips
+                                    ):
+                                        is_active = True
+                                        break
+
+                                if is_active:
+                                    active_found.extend(interface_dns)
                         except OSError:
                             continue
 
@@ -123,23 +159,27 @@ class DNSScanner:
             except OSError:
                 pass
 
-        valid: list[str] = []
+        def _validate_candidates(candidates: list[str]) -> list[str]:
+            valid: list[str] = []
 
-        for candidate in found:
-            candidate = candidate.strip().strip("[]")
+            for candidate in candidates:
+                candidate = candidate.strip().strip("[]")
+                ip_part, sep, zone = candidate.partition("%")
 
-            try:
-                valid.append(
-                    str(
-                        ipaddress.ip_address(
-                            candidate.split("%", 1)[0]
-                        )
-                    )
-                )
-            except ValueError:
-                continue
+                try:
+                    ip = ipaddress.ip_address(ip_part)
+                except ValueError:
+                    continue
 
-        return list(dict.fromkeys(valid))
+                if sep and isinstance(ip, ipaddress.IPv6Address) and zone:
+                    valid.append(f"{ip}%{zone}")
+                else:
+                    valid.append(str(ip))
+
+            return list(dict.fromkeys(valid))
+
+        preferred = _validate_candidates(active_found)
+        return preferred if preferred else _validate_candidates(found)
 
     @staticmethod
     def _normalize_name(name: str) -> str:
@@ -188,9 +228,14 @@ class DNSScanner:
         return bytes(output)
 
     @staticmethod
+    def _strip_trailing_dot(name: str) -> str:
+        return "." if name == "." else name.rstrip(".")
+
+    @staticmethod
     def _decode_name(
         packet: bytes,
         offset: int,
+        max_wire_end: int | None = None,
     ) -> tuple[str, int]:
         """Decode a possibly compressed DNS name."""
         labels: list[str] = []
@@ -198,15 +243,22 @@ class DNSScanner:
         next_offset: int | None = None
         jumps = 0
         visited: set[int] = set()
+        packet_end = len(packet)
 
         while True:
-            if cursor >= len(packet):
+            limit = (
+                max_wire_end
+                if next_offset is None and max_wire_end is not None
+                else packet_end
+            )
+
+            if cursor >= limit:
                 raise ValueError("DNS name extends beyond packet.")
 
             length = packet[cursor]
 
             if length & 0xC0 == 0xC0:
-                if cursor + 1 >= len(packet):
+                if cursor + 1 >= limit:
                     raise ValueError(
                         "Incomplete DNS compression pointer."
                     )
@@ -215,7 +267,7 @@ class DNSScanner:
                     (length & 0x3F) << 8
                 ) | packet[cursor + 1]
 
-                if pointer >= len(packet) or pointer in visited:
+                if pointer >= packet_end or pointer in visited:
                     raise ValueError(
                         "Invalid or cyclic DNS compression pointer."
                     )
@@ -247,7 +299,7 @@ class DNSScanner:
                     next_offset = cursor
                 break
 
-            if length > 63 or cursor + length > len(packet):
+            if length > 63 or cursor + length > limit:
                 raise ValueError("Invalid DNS label length.")
 
             raw = packet[cursor:cursor + length]
@@ -321,58 +373,89 @@ class DNSScanner:
 
         return header + question + opt
 
-    def _exchange(
+    def _resolve_nameserver_target(
         self,
         nameserver: str,
-        query: bytes,
-        transaction_id: int,
-    ) -> tuple[bytes, float]:
+        socktype: int,
+    ) -> tuple[int, tuple[Any, ...], str]:
         family = (
             socket.AF_INET6
             if ":" in nameserver
             else socket.AF_INET
         )
 
+        if "%" in nameserver:
+            infos = socket.getaddrinfo(
+                nameserver,
+                self.port,
+                family,
+                socktype,
+            )
+            chosen_family, _, _, _, sockaddr = infos[0]
+            return chosen_family, sockaddr, sockaddr[0]
+
+        return family, (nameserver, self.port), nameserver
+
+    @staticmethod
+    def _addresses_match(source_ip: str, expected_ip: str) -> bool:
+        if source_ip == expected_ip:
+            return True
+
+        try:
+            return (
+                ipaddress.ip_address(source_ip.split("%", 1)[0])
+                == ipaddress.ip_address(expected_ip.split("%", 1)[0])
+            )
+        except ValueError:
+            return False
+
+    def _exchange(
+        self,
+        nameserver: str,
+        query: bytes,
+        transaction_id: int,
+    ) -> tuple[bytes, float]:
+        family, sockaddr, expected_ip = self._resolve_nameserver_target(
+            nameserver, socket.SOCK_DGRAM
+        )
+
         start = time.perf_counter()
+        deadline = start + self.timeout
 
         with socket.socket(
             family, socket.SOCK_DGRAM
         ) as sock:
-            sock.settimeout(self.timeout)
-            sock.sendto(query, (nameserver, self.port))
-            packet, source = sock.recvfrom(65535)
+            while True:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    raise TimeoutError("Timed out waiting for DNS response.")
 
-            if source[1] != self.port:
-                raise OSError(
-                    "DNS response came from an unexpected source port."
-                )
+                sock.settimeout(remaining)
+                sock.sendto(query, sockaddr)
+                packet, source = sock.recvfrom(65535)
+
+                if (
+                    source[1] != self.port
+                    or not self._addresses_match(source[0], expected_ip)
+                ):
+                    continue
+
+                if len(packet) < 12:
+                    continue
+
+                response_id = struct.unpack_from("!H", packet, 0)[0]
+                if response_id != transaction_id:
+                    continue
+
+                flags = struct.unpack_from("!H", packet, 2)[0]
+                if not flags & 0x8000:
+                    continue
+
+                break
 
         elapsed_ms = (
             time.perf_counter() - start
         ) * 1000
-
-        if len(packet) < 12:
-            raise ValueError(
-                "DNS response header is too short."
-            )
-
-        response_id = struct.unpack_from(
-            "!H", packet, 0
-        )[0]
-
-        if response_id != transaction_id:
-            raise ValueError(
-                "DNS transaction ID mismatch."
-            )
-
-        flags = struct.unpack_from(
-            "!H", packet, 2
-        )[0]
-
-        if not flags & 0x8000:
-            raise ValueError(
-                "Packet is not a DNS response."
-            )
 
         if flags & 0x0200:
             packet = self._exchange_tcp(
@@ -391,17 +474,15 @@ class DNSScanner:
         query: bytes,
         transaction_id: int,
     ) -> bytes:
-        family = (
-            socket.AF_INET6
-            if ":" in nameserver
-            else socket.AF_INET
+        family, sockaddr, _ = self._resolve_nameserver_target(
+            nameserver, socket.SOCK_STREAM
         )
 
         with socket.socket(
             family, socket.SOCK_STREAM
         ) as sock:
             sock.settimeout(self.timeout)
-            sock.connect((nameserver, self.port))
+            sock.connect(sockaddr)
             sock.sendall(
                 struct.pack("!H", len(query)) + query
             )
@@ -482,7 +563,7 @@ class DNSScanner:
         )
 
         record: dict[str, Any] = {
-            "name": name.rstrip("."),
+            "name": cls._strip_trailing_dot(name),
             "type": kind,
             "class": "IN" if rclass == 1 else rclass,
             "ttl": ttl,
@@ -499,29 +580,38 @@ class DNSScanner:
             )
 
         elif rtype in (2, 5, 12):
-            value, _ = cls._decode_name(packet, rstart)
-            record["value"] = (
-                value.rstrip(".") if value != "." else "."
+            value, pos = cls._decode_name(
+                packet, rstart, max_wire_end=rend
             )
+            if pos != rend:
+                raise ValueError("Malformed DNS domain-name record.")
+            record["value"] = cls._strip_trailing_dot(value)
 
         elif rtype == 15 and rdlength >= 3:
             preference = struct.unpack_from(
                 "!H", packet, rstart
             )[0]
 
-            exchange, _ = cls._decode_name(
-                packet, rstart + 2
+            exchange, pos = cls._decode_name(
+                packet, rstart + 2, max_wire_end=rend
             )
+            if pos != rend:
+                raise ValueError("Malformed MX record.")
 
+            clean_exchange = cls._strip_trailing_dot(exchange)
             record.update({
                 "preference": preference,
-                "exchange": exchange.rstrip("."),
-                "value": f"{preference} {exchange.rstrip('.')}",
+                "exchange": clean_exchange,
+                "value": f"{preference} {clean_exchange}",
             })
 
         elif rtype == 6:
-            mname, pos = cls._decode_name(packet, rstart)
-            rname, pos = cls._decode_name(packet, pos)
+            mname, pos = cls._decode_name(
+                packet, rstart, max_wire_end=rend
+            )
+            rname, pos = cls._decode_name(
+                packet, pos, max_wire_end=rend
+            )
             serial, pos = cls._read_u32(packet, pos)
             refresh, pos = cls._read_u32(packet, pos)
             retry, pos = cls._read_u32(packet, pos)
@@ -532,8 +622,8 @@ class DNSScanner:
                 raise ValueError("Malformed SOA record.")
 
             record.update({
-                "mname": mname.rstrip("."),
-                "rname": rname.rstrip("."),
+                "mname": cls._strip_trailing_dot(mname),
+                "rname": cls._strip_trailing_dot(rname),
                 "serial": serial,
                 "refresh": refresh,
                 "retry": retry,
@@ -624,8 +714,10 @@ class DNSScanner:
             )
 
             signer, pos = cls._decode_name(
-                packet, rstart + 18
+                packet, rstart + 18, max_wire_end=rend
             )
+            if pos > rend:
+                raise ValueError("Malformed RRSIG record.")
 
             record.update({
                 "type_covered": covered,
@@ -635,7 +727,7 @@ class DNSScanner:
                 "expiration": expiration,
                 "inception": inception,
                 "key_tag": key_tag,
-                "signer": signer.rstrip("."),
+                "signer": cls._strip_trailing_dot(signer),
                 "signature": packet[pos:rend].hex(),
             })
 
@@ -644,16 +736,19 @@ class DNSScanner:
                 "!HHH", data, 0
             )
 
-            target, _ = cls._decode_name(
-                packet, rstart + 6
+            target, pos = cls._decode_name(
+                packet, rstart + 6, max_wire_end=rend
             )
+            if pos != rend:
+                raise ValueError("Malformed SRV record.")
 
+            clean_target = cls._strip_trailing_dot(target)
             record.update({
                 "priority": priority,
                 "weight": weight,
                 "port": port,
-                "target": target.rstrip("."),
-                "value": f"{priority} {weight} {port} {target}",
+                "target": clean_target,
+                "value": f"{priority} {weight} {port} {clean_target}",
             })
 
         else:
@@ -860,6 +955,10 @@ class DNSScanner:
                 return
 
             for record in entries:
+                entry_type = record.get("type", record_type)
+                if entry_type == "CNAME" and record_type != "CNAME":
+                    continue
+
                 if record_type == "MX":
                     value = (
                         f"{record.get('exchange', '')} "
@@ -965,6 +1064,9 @@ class DNSScanner:
         }
 
         try:
+            if not isinstance(target, str):
+                raise TypeError("Domain must be a string.")
+
             domain = target.strip().rstrip(".")
 
             if not domain:
@@ -981,7 +1083,6 @@ class DNSScanner:
             if include_dnssec:
                 record_types.extend(["DS", "DNSKEY", "RRSIG"])
 
-            
             records = {
                 record_type: self.query(domain, record_type)
                 for record_type in record_types
@@ -990,13 +1091,17 @@ class DNSScanner:
             # Some DNS resolvers include CNAME records in A/AAAA answers.
             # Use those records as a fallback if the direct CNAME query
             # did not return an alias.
-            cname_records = records["CNAME"].get("records", [])
+            cname_records = list(records["CNAME"].get("records", []))
 
             if not cname_records:
+                seen_cnames: set[tuple[str | None, str | None]] = set()
                 for record_type in ("A", "AAAA"):
                     for record in records[record_type].get("records", []):
                         if record.get("type") == "CNAME":
-                            cname_records.append(record)
+                            key = (record.get("name"), record.get("value"))
+                            if key not in seen_cnames:
+                                seen_cnames.add(key)
+                                cname_records.append(record)
 
             if cname_records:
                 records["CNAME"]["records"] = cname_records
@@ -1022,13 +1127,19 @@ class DNSScanner:
             txt_records = [
                 record.get("value", "")
                 for record in records["TXT"].get("records", [])
-                if isinstance(record.get("value"), str)
+                if (
+                    record.get("type", "TXT") == "TXT"
+                    and isinstance(record.get("value"), str)
+                )
             ]
 
             # SPF.
             spf_records = [
                 value for value in txt_records
-                if value.lower().startswith("v=spf1")
+                if (
+                    value.lower() == "v=spf1"
+                    or value.lower().startswith("v=spf1 ")
+                )
             ]
 
             spf_terms = (
@@ -1071,13 +1182,23 @@ class DNSScanner:
                 f"_dmarc.{domain}", "TXT"
             )
 
+            if dmarc_result.get("status") in failed_statuses:
+                result["findings"].append(
+                    f"DMARC query failed: {dmarc_result.get('status')}"
+                )
+
             dmarc_records = [
                 record.get("value", "")
                 for record in dmarc_result.get("records", [])
                 if (
-                    isinstance(record.get("value"), str)
-                    and record.get("value", "")
-                    .lower().startswith("v=dmarc1")
+                    record.get("type", "TXT") == "TXT"
+                    and isinstance(record.get("value"), str)
+                    and (
+                        record.get("value", "").strip().lower() == "v=dmarc1"
+                        or record.get("value", "").strip().lower().startswith(
+                            ("v=dmarc1;", "v=dmarc1 ")
+                        )
+                    )
                 )
             ]
 
@@ -1120,7 +1241,7 @@ class DNSScanner:
 
             if (
                 len(dmarc_records) == 1
-                and dmarc_tags.get("p") == "none"
+                and (dmarc_tags.get("p") or "").lower() == "none"
             ):
                 result["findings"].append(
                     "DMARC policy is set to none"
@@ -1150,11 +1271,17 @@ class DNSScanner:
                         "TXT",
                     )
 
+                    if dkim_result.get("status") in failed_statuses:
+                        result["findings"].append(
+                            f"DKIM query failed: {dkim_result.get('status')}"
+                        )
+
                     dkim_records = [
                         record.get("value", "")
                         for record in dkim_result.get("records", [])
                         if (
-                            isinstance(record.get("value"), str)
+                            record.get("type", "TXT") == "TXT"
+                            and isinstance(record.get("value"), str)
                             and "p=" in record.get("value", "").lower()
                         )
                     ]
@@ -1197,15 +1324,25 @@ class DNSScanner:
                 }
 
             # Only report absence when the DNS query succeeded.
+            mx_records = [
+                record
+                for record in records["MX"].get("records", [])
+                if record.get("type", "MX") == "MX"
+            ]
             if (
-                not records["MX"].get("records")
+                not mx_records
                 and records["MX"].get("status")
                 in {"NOERROR", "NO_RECORDS"}
             ):
                 result["findings"].append("No MX records found")
 
+            caa_records = [
+                record
+                for record in records["CAA"].get("records", [])
+                if record.get("type", "CAA") == "CAA"
+            ]
             if (
-                not records["CAA"].get("records")
+                not caa_records
                 and records["CAA"].get("status")
                 in {"NOERROR", "NO_RECORDS"}
             ):

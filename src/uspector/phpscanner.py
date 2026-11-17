@@ -1,12 +1,15 @@
 
 # Uspector - Copyright (c) 2026 Menahem Levinski
 
-import ipaddress
+import json
 import re
 import socket
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
+from requests.structures import CaseInsensitiveDict
+
+from ._http import PinnedIPAdapter, validate_public_http_url, validate_timeout
 
 
 class PHPScanner:
@@ -51,7 +54,7 @@ class PHPScanner:
     }
 
     def __init__(self, timeout=10):
-        self.timeout = timeout
+        self.timeout = validate_timeout(timeout)
 
     # --------------------------------------------------
     # Target validation
@@ -79,7 +82,7 @@ class PHPScanner:
         if parsed.username or parsed.password:
             raise ValueError("URLs containing credentials are not supported.")
 
-        if parsed.port and not (1 <= parsed.port <= 65535):
+        if parsed.port is not None and not (1 <= parsed.port <= 65535):
             raise ValueError("Invalid target port.")
 
         if parsed.hostname.lower() == "localhost":
@@ -96,50 +99,30 @@ class PHPScanner:
 
     @staticmethod
     def _validate_destination(url):
-
-        parsed = urlparse(url)
-        hostname = parsed.hostname
-
-        if not hostname:
-            raise ValueError("Invalid redirect destination.")
-
-        if parsed.scheme not in ("http", "https"):
-            raise ValueError("Unsupported redirect protocol.")
-
-        if parsed.username or parsed.password:
-            raise ValueError("Redirect credentials are not allowed.")
-
-        try:
-            addresses = socket.getaddrinfo(
-                hostname,
-                parsed.port or (443 if parsed.scheme == "https" else 80),
-                type=socket.SOCK_STREAM,
-            )
-        except socket.gaierror:
-            raise ValueError("Unable to resolve target hostname.")
-
-        if not addresses:
-            raise ValueError("Target hostname did not resolve.")
-
-        for address in addresses:
-            ip = ipaddress.ip_address(address[4][0])
-
-            if not ip.is_global:
-                raise ValueError(
-                    "Target resolves to a private or restricted IP address."
-                )
+        return validate_public_http_url(
+            url,
+            error_prefix="Target",
+            resolver=socket.getaddrinfo,
+        )
 
     # --------------------------------------------------
     # HTTP request handling
     # --------------------------------------------------
 
-    def _request(self, session, url):
+    def _request(self, session, url, pinned_ips=None):
 
         current_url = url
 
         for _ in range(self.MAX_REDIRECTS + 1):
 
-            self._validate_destination(current_url)
+            validated = self._validate_destination(current_url)
+            if (
+                pinned_ips is not None
+                and isinstance(validated, tuple)
+                and len(validated) == 3
+            ):
+                dest_host, dest_port, dest_ip = validated
+                pinned_ips[(dest_host, dest_port)] = dest_ip
 
             response = session.get(
                 current_url,
@@ -186,7 +169,7 @@ class PHPScanner:
                 return {
                     "url": current_url,
                     "status_code": response.status_code,
-                    "headers": dict(response.headers),
+                    "headers": CaseInsensitiveDict(response.headers),
                     "body": body,
                     "content_type": response.headers.get(
                         "Content-Type", ""
@@ -216,14 +199,19 @@ class PHPScanner:
         if match:
             return match.group(1), "X-Powered-By"
 
-        match = re.search(
-            r"PHP Version ([0-9]+(?:\.[0-9]+){1,3})",
-            body,
-            re.IGNORECASE,
-        )
+        if (
+            PHPScanner._is_phpinfo(body)
+            or PHPScanner._is_php_error(body)
+            or re.search(r'<h1[^>]*class=["\']p["\'][^>]*>\s*PHP Version\s+[0-9]', body, re.IGNORECASE)
+        ):
+            match = re.search(
+                r"PHP Version ([0-9]+(?:\.[0-9]+){1,3})",
+                body,
+                re.IGNORECASE,
+            )
 
-        if match:
-            return match.group(1), "Response Body"
+            if match:
+                return match.group(1), "Response Body"
 
         return None, None
 
@@ -263,6 +251,81 @@ class PHPScanner:
 
         return PHPScanner._contains_pattern(body, patterns)
 
+    @staticmethod
+    def _is_html_or_asset_response(content_type, body):
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        if media_type in (
+            "text/html",
+            "application/xhtml+xml",
+            "text/css",
+            "application/javascript",
+            "text/javascript",
+        ):
+            return True
+
+        stripped = body.lstrip()[:64].lower()
+        return stripped.startswith(("<!doctype html", "<html"))
+
+    @classmethod
+    def _matches_exposed_file(cls, filename, response_body, content_type):
+        if filename in ("phpinfo.php", "info.php"):
+            return cls._is_phpinfo(response_body)
+
+        if filename == "test.php":
+            if cls._is_phpinfo(response_body) or cls._is_php_error(response_body):
+                return True
+            if cls._is_html_or_asset_response(content_type, response_body):
+                return False
+            return "<?php" in response_body or bool(
+                re.search(
+                    r"\b(?:phpinfo|var_dump|print_r|xdebug|display_errors)\b",
+                    response_body,
+                    re.IGNORECASE,
+                )
+            )
+
+        if cls._is_html_or_asset_response(content_type, response_body):
+            return False
+
+        if filename.startswith(".env"):
+            return bool(re.search(r"(?m)^\s*[A-Z_][A-Z0-9_]*\s*=", response_body))
+
+        if filename == "composer.json":
+            try:
+                data = json.loads(response_body)
+            except (ValueError, TypeError):
+                return False
+            return isinstance(data, dict) and any(
+                key in data
+                for key in ("name", "require", "require-dev", "autoload", "scripts")
+            )
+
+        if filename == "composer.lock":
+            try:
+                data = json.loads(response_body)
+            except (ValueError, TypeError):
+                return False
+            return isinstance(data, dict) and "packages" in data
+
+        if filename.endswith((".bak", ".old", "~")):
+            return "<?php" in response_body or bool(
+                re.search(
+                    r"(?m)^\s*\$?\w*(?:DB_PASSWORD|DB_USERNAME|db_pass|password)\s*[=:]",
+                    response_body,
+                    re.IGNORECASE,
+                )
+            )
+
+        if filename == "php.ini":
+            return bool(
+                re.search(
+                    r"(?m)^\s*(?:display_errors|expose_php|memory_limit)\s*=",
+                    response_body,
+                )
+            )
+
+        return True
+
     # --------------------------------------------------
     # Findings
     # --------------------------------------------------
@@ -301,169 +364,166 @@ class PHPScanner:
         try:
 
             base_url = self._normalize_url(target)
+            pinned_ips = {}
 
-            session = requests.Session()
-            session.trust_env = False
-            session.headers.update({
-                "User-Agent": self.USER_AGENT,
-                "Accept": "text/html,application/json,*/*",
-            })
+            with requests.Session() as session:
+                session.trust_env = False
+                adapter = PinnedIPAdapter(pinned_ips)
+                session.mount("http://", adapter)
+                session.mount("https://", adapter)
+                session.headers.update({
+                    "User-Agent": self.USER_AGENT,
+                    "Accept": "text/html,application/json,*/*",
+                })
 
-            # Main page
-            main_response = self._request(session, base_url)
+                # Main page
+                main_response = self._request(session, base_url, pinned_ips)
 
-            headers = main_response["headers"]
-            body = main_response["body"]
+                headers = main_response["headers"]
+                body = main_response["body"]
 
-            powered_by = headers.get("X-Powered-By", "")
-            server = headers.get("Server", "")
+                powered_by = headers.get("X-Powered-By", "")
+                server = headers.get("Server", "")
 
-            result["server_software"] = server or None
+                result["server_software"] = server or None
 
-            php_version, version_method = self._detect_php_version(
-                headers,
-                body,
-            )
-
-            if php_version:
-                result["php_detected"] = True
-                result["php_version"] = php_version
-                result["detection_method"] = version_method
-                result["version_disclosure"] = True
-
-            elif "php" in powered_by.lower():
-                result["php_detected"] = True
-                result["detection_method"] = "X-Powered-By"
-
-            elif "PHPSESSID" in headers.get("Set-Cookie", ""):
-                result["php_detected"] = True
-                result["detection_method"] = "PHP Session Cookie"
-
-            if result["version_disclosure"]:
-
-                self._add_finding(
-                    result["findings"],
-                    "LOW",
-                    "PHP Version Disclosure",
-                    f"The server disclosed PHP version {php_version}.",
-                    "Remove PHP version information from HTTP response headers.",
+                php_version, version_method = self._detect_php_version(
+                    headers,
+                    body,
                 )
 
-            # Error disclosure
-            if self._is_php_error(body):
+                if php_version:
+                    result["php_detected"] = True
+                    result["php_version"] = php_version
+                    result["detection_method"] = version_method
+                    result["version_disclosure"] = True
 
-                result["php_error_disclosure"] = True
+                elif "php" in powered_by.lower():
+                    result["php_detected"] = True
+                    result["detection_method"] = "X-Powered-By"
 
-                self._add_finding(
-                    result["findings"],
-                    "MEDIUM",
-                    "PHP Error Disclosure",
-                    "The response appears to contain PHP error information.",
-                    "Disable public error display and configure server-side error logging.",
-                )
+                elif "PHPSESSID" in headers.get("Set-Cookie", ""):
+                    result["php_detected"] = True
+                    result["detection_method"] = "PHP Session Cookie"
 
-            # Directory listing
-            if self._is_directory_listing(body):
+                if result["version_disclosure"]:
+                    self._add_finding(
+                        result["findings"],
+                        "LOW",
+                        "PHP Version Disclosure",
+                        f"The server disclosed PHP version {php_version}.",
+                        "Remove PHP version information from HTTP response headers.",
+                    )
 
-                result["directory_listing"] = True
+                main_phpinfo = self._is_phpinfo(body)
+                if main_phpinfo:
+                    result["php_detected"] = True
+                    result["phpinfo_exposure"] = True
+                    if not result["detection_method"]:
+                        result["detection_method"] = "phpinfo()"
+                    self._add_finding(
+                        result["findings"],
+                        "HIGH",
+                        "PHP Information Exposure",
+                        "A publicly accessible phpinfo() page was detected.",
+                        "Remove the exposed page or restrict access to authorized administrators.",
+                    )
 
-                self._add_finding(
-                    result["findings"],
-                    "MEDIUM",
-                    "Directory Listing Enabled",
-                    "The server appears to expose a directory index.",
-                    "Disable directory listing in the web server configuration.",
-                )
-
-            # PHP-related exposure checks
-            parsed = urlparse(base_url)
-            origin = f"{parsed.scheme}://{parsed.netloc}/"
-
-            for filename, severity in self.EXPOSED_FILES.items():
-
-                probe_url = urljoin(origin, filename)
-
-                try:
-                    response = self._request(session, probe_url)
-
-                    if response["status_code"] != 200:
-                        continue
-
-                    response_body = response["body"]
-                    content_type = response["content_type"].lower()
-
-                    if not response_body.strip():
-                        continue
-
-                    if filename in ("phpinfo.php", "info.php"):
-                        if not self._is_phpinfo(response_body):
-                            continue
-
-                        result["phpinfo_exposure"] = True
-
-                    elif filename.startswith(".env"):
-                        # Avoid reporting a generic HTML fallback as an exposed file.
-                        if not re.search(
-                            r"(?m)^\s*[A-Z_][A-Z0-9_]*\s*=",
-                            response_body,
-                        ):
-                            continue
-
-                    elif filename == "composer.json":
-                        if not re.search(
-                            r'"(?:name|require|autoload|scripts)"\s*:',
-                            response_body,
-                        ):
-                            continue
-
-                    elif filename == "composer.lock":
-                        if '"packages"' not in response_body:
-                            continue
-
-                    elif filename.endswith((".bak", ".old", "~")):
-                        # Require recognizable PHP source/configuration content.
-                        if "<?php" not in response_body and not re.search(
-                            r"(?:DB_PASSWORD|DB_USERNAME|database|password)\s*=",
-                            response_body,
-                            re.IGNORECASE,
-                        ):
-                            continue
-
-                    elif filename == "php.ini":
-                        if not re.search(
-                            r"(?m)^\s*(?:display_errors|expose_php|memory_limit)\s*=",
-                            response_body,
-                        ):
-                            continue
-
-                    result["exposed_files"].append({
-                        "file": filename,
-                        "status_code": response["status_code"],
-                        "severity": severity,
-                    })
+                # Error disclosure
+                if self._is_php_error(body):
+                    result["php_error_disclosure"] = True
+                    if not result["php_detected"]:
+                        result["php_detected"] = True
+                        result["detection_method"] = "PHP Error Message"
 
                     self._add_finding(
                         result["findings"],
-                        severity,
-                        f"Exposed File: {filename}",
-                        f"The file {filename} appears to be publicly accessible.",
-                        "Restrict access to sensitive files and remove unnecessary public backups.",
+                        "MEDIUM",
+                        "PHP Error Disclosure",
+                        "The response appears to contain PHP error information.",
+                        "Disable public error display and configure server-side error logging.",
                     )
 
-                except (requests.RequestException, ValueError):
-                    continue
+                # Directory listing
+                if self._is_directory_listing(body):
+                    result["directory_listing"] = True
 
-            if result["phpinfo_exposure"]:
+                    self._add_finding(
+                        result["findings"],
+                        "MEDIUM",
+                        "Directory Listing Enabled",
+                        "The server appears to expose a directory index.",
+                        "Disable directory listing in the web server configuration.",
+                    )
 
-                self._add_finding(
-                    result["findings"],
-                    "HIGH",
-                    "PHP Information Exposure",
-                    "A publicly accessible phpinfo() page was detected.",
-                    "Remove the exposed page or restrict access to authorized administrators.",
-                )
+                # PHP-related exposure checks against the final post-redirect location
+                final_parsed = urlparse(main_response.get("url") or base_url)
+                base_path = final_parsed.path or "/"
+                if not base_path.endswith("/"):
+                    base_path = base_path.rsplit("/", 1)[0] + "/"
+                probe_base = f"{final_parsed.scheme}://{final_parsed.netloc}{base_path}"
 
-            session.close()
+                for filename, severity in self.EXPOSED_FILES.items():
+
+                    probe_url = urljoin(probe_base, filename)
+
+                    try:
+                        response = self._request(session, probe_url, pinned_ips)
+
+                        if response["status_code"] != 200:
+                            continue
+
+                        response_body = response["body"]
+                        content_type = response["content_type"].lower()
+
+                        if not response_body.strip():
+                            continue
+
+                        if not self._matches_exposed_file(
+                            filename,
+                            response_body,
+                            content_type,
+                        ):
+                            continue
+
+                        if filename in ("phpinfo.php", "info.php"):
+                            result["phpinfo_exposure"] = True
+                            result["php_detected"] = True
+                            if not result["detection_method"]:
+                                result["detection_method"] = f"Exposed {filename}"
+
+                            probe_version, probe_method = self._detect_php_version(
+                                response["headers"],
+                                response_body,
+                            )
+                            if probe_version and not result["php_version"]:
+                                result["php_version"] = probe_version
+                                result["detection_method"] = probe_method
+                                result["version_disclosure"] = True
+                                self._add_finding(
+                                    result["findings"],
+                                    "LOW",
+                                    "PHP Version Disclosure",
+                                    f"The server disclosed PHP version {probe_version}.",
+                                    "Remove PHP version information from HTTP response headers.",
+                                )
+
+                        result["exposed_files"].append({
+                            "file": filename,
+                            "status_code": response["status_code"],
+                            "severity": severity,
+                        })
+
+                        self._add_finding(
+                            result["findings"],
+                            severity,
+                            f"Exposed File: {filename}",
+                            f"The file {filename} appears to be publicly accessible.",
+                            "Restrict access to sensitive files and remove unnecessary public backups.",
+                        )
+
+                    except (requests.RequestException, ValueError):
+                        continue
 
             # Verdict
             severities = {

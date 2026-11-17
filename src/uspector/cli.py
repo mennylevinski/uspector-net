@@ -145,30 +145,57 @@ def main():
                 dkim_selector=args.dkim_selector,
                 include_dnssec=not args.no_dnssec,
             )
-            title = f"Uspector DNS Scan: {args.hostname}"
 
         elif args.command == "tls":
             scanner = TLSScanner(timeout=args.timeout)
             result = scanner.check_tls(args.hostname, args.port)
-            title = f"Uspector TLS Scan: {args.hostname}:{args.port}"
 
         elif args.command == "web":
             scanner = WebScanner(timeout=args.timeout)
             result = scanner.scan(args.target)
-            title = f"Uspector Web Scan: {args.target}"
 
         elif args.command == "php":
             scanner = PHPScanner(timeout=args.timeout)
             result = scanner.scan(args.target)
-            title = f"Uspector PHP Scan: {args.target}"
 
         if args.json:
             print(json.dumps(result, indent=2, default=str))
         else:
             print(scanner.format_scan(result))
 
-        if isinstance(result, dict) and result.get("error"):
-            return 1
+        if isinstance(result, dict):
+            if result.get("error"):
+                return 1
+
+            if (
+                args.command == "tls"
+                and result.get("connection_status") == "Failed"
+                and result.get("diagnostic_handshake") == "Failed"
+            ):
+                return 1
+
+            if args.command == "dns":
+                records = result.get("records")
+                failed_statuses = {
+                    "DNS_ERROR",
+                    "INVALID_QUERY",
+                    "SERVFAIL",
+                    "REFUSED",
+                    "FORMERR",
+                    "NOTIMP",
+                    "NOTAUTH",
+                    "NOTZONE",
+                }
+                if (
+                    isinstance(records, dict)
+                    and records
+                    and all(
+                        isinstance(entry, dict)
+                        and entry.get("status") in failed_statuses
+                        for entry in records.values()
+                    )
+                ):
+                    return 1
 
         return 0
 
