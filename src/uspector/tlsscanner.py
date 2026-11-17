@@ -8,16 +8,17 @@ import ssl
 import time
 import warnings
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
 import requests
 
 from cryptography import x509
+from cryptography.exceptions import InvalidSignature
 from cryptography.x509 import ocsp
-from cryptography.x509.oid import AuthorityInformationAccessOID
+from cryptography.x509.oid import AuthorityInformationAccessOID, ExtendedKeyUsageOID
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.asymmetric import ec, ed448, ed25519, padding, rsa
 
 from ._http import PinnedIPAdapter, validate_public_http_url
 
@@ -272,14 +273,147 @@ class TLSScanner:
 
         return chain
 
-    # ====== OCSP Revocation Check ======
-    def _check_ocsp(self, certificate, certificate_chain):
-        """
-        Query the certificate's OCSP responder.
+    # ====== Signature Verification ======
+    @staticmethod
+    def _verify_signature(public_key, signature, data, hash_algorithm):
+        """Verify an X.509 or OCSP signature against a candidate public key."""
+        try:
+            if isinstance(public_key, rsa.RSAPublicKey):
+                if hash_algorithm is None:
+                    return False
+                try:
+                    public_key.verify(
+                        signature,
+                        data,
+                        padding.PKCS1v15(),
+                        hash_algorithm,
+                    )
+                    return True
+                except InvalidSignature:
+                    public_key.verify(
+                        signature,
+                        data,
+                        padding.PSS(
+                            mgf=padding.MGF1(hash_algorithm),
+                            salt_length=padding.PSS.AUTO,
+                        ),
+                        hash_algorithm,
+                    )
+                    return True
 
-        OCSP status is reported as unvalidated. This method does not verify
-        the response signature, responder authorization, certificate ID,
-        or response freshness, so it cannot establish revocation status.
+            if isinstance(public_key, ec.EllipticCurvePublicKey):
+                if hash_algorithm is None:
+                    return False
+                public_key.verify(signature, data, ec.ECDSA(hash_algorithm))
+                return True
+
+            if isinstance(public_key, (ed25519.Ed25519PublicKey, ed448.Ed448PublicKey)):
+                public_key.verify(signature, data)
+                return True
+
+        except (InvalidSignature, TypeError, ValueError):
+            return False
+
+        return False
+
+    # ====== OCSP Revocation Check ======
+    def _validate_ocsp_response(
+        self,
+        ocsp_response,
+        certificate,
+        issuer,
+        certificate_trusted,
+    ):
+        """Validate OCSP CertID, freshness, and cryptographic signature."""
+        now = datetime.now(timezone.utc)
+        serial_matches = ocsp_response.serial_number == certificate.serial_number
+
+        this_update = getattr(ocsp_response, "this_update_utc", None)
+        next_update = getattr(ocsp_response, "next_update_utc", None)
+        is_fresh = True
+        if this_update is not None and this_update > now + timedelta(minutes=5):
+            is_fresh = False
+        if next_update is not None and next_update < now:
+            is_fresh = False
+
+        signer_key = None
+        responder_certs = getattr(ocsp_response, "certificates", None) or []
+        resp_key_hash = getattr(ocsp_response, "responder_key_hash", None)
+        resp_name = getattr(ocsp_response, "responder_name", None)
+
+        if responder_certs:
+            for candidate in responder_certs:
+                spki_bytes = candidate.public_key().public_bytes(
+                    serialization.Encoding.DER,
+                    serialization.PublicFormat.SubjectPublicKeyInfo,
+                )
+                # RFC 6960 responderKeyHash is SHA-1 of BIT STRING contents;
+                # also match subject name if present.
+                name_match = resp_name is not None and candidate.subject == resp_name
+                key_match = resp_key_hash is not None and (
+                    hashlib.sha1(spki_bytes).digest() == resp_key_hash
+                    or any(
+                        hashlib.sha1(spki_bytes[idx:]).digest() == resp_key_hash
+                        for idx in range(min(32, len(spki_bytes)))
+                    )
+                )
+                if not (name_match or key_match):
+                    continue
+
+                if candidate.issuer != issuer.subject:
+                    continue
+                if now < candidate.not_valid_before_utc or now > candidate.not_valid_after_utc:
+                    continue
+
+                try:
+                    eku = candidate.extensions.get_extension_for_class(
+                        x509.ExtendedKeyUsage
+                    ).value
+                    if ExtendedKeyUsageOID.OCSP_SIGNING not in eku:
+                        continue
+                except x509.ExtensionNotFound:
+                    continue
+
+                if self._verify_signature(
+                    issuer.public_key(),
+                    candidate.signature,
+                    candidate.tbs_certificate_bytes,
+                    candidate.signature_hash_algorithm,
+                ):
+                    signer_key = candidate.public_key()
+                    break
+
+        if signer_key is None and (
+            resp_name is None or resp_name == issuer.subject or not responder_certs
+        ):
+            signer_key = issuer.public_key()
+
+        sig_valid = False
+        if signer_key is not None:
+            sig_valid = self._verify_signature(
+                signer_key,
+                ocsp_response.signature,
+                ocsp_response.tbs_response_bytes,
+                ocsp_response.signature_hash_algorithm,
+            )
+
+        validated = bool(
+            serial_matches
+            and is_fresh
+            and sig_valid
+            and certificate_trusted
+        )
+
+        return {
+            "serial_matches": serial_matches,
+            "fresh": is_fresh,
+            "signature_valid": sig_valid,
+            "validated": validated,
+        }
+
+    def _check_ocsp(self, certificate, certificate_chain, certificate_trusted=False):
+        """
+        Query and validate the certificate's OCSP responder.
         """
 
         result = {
@@ -410,18 +544,36 @@ class TLSScanner:
                 )
                 return result
 
-            # Parsed status only; response authenticity and freshness
-            # have not been validated.
+            validation = self._validate_ocsp_response(
+                ocsp_response,
+                certificate,
+                issuer,
+                certificate_trusted,
+            )
+            result["signature_valid"] = validation["signature_valid"]
+            result["fresh"] = validation["fresh"]
+            result["response_validated"] = validation["validated"]
+
+            if not validation["serial_matches"]:
+                result["status"] = "Serial Mismatch"
+                return result
+
             certificate_status = ocsp_response.certificate_status
 
-            if certificate_status == ocsp.OCSPCertStatus.GOOD:
-                result["status"] = "REPORTED_GOOD_UNVALIDATED"
-
-            elif certificate_status == ocsp.OCSPCertStatus.REVOKED:
-                result["status"] = "REPORTED_REVOKED_UNVALIDATED"
-
+            if validation["validated"]:
+                if certificate_status == ocsp.OCSPCertStatus.GOOD:
+                    result["status"] = "GOOD"
+                elif certificate_status == ocsp.OCSPCertStatus.REVOKED:
+                    result["status"] = "REVOKED"
+                else:
+                    result["status"] = "UNKNOWN"
             else:
-                result["status"] = "REPORTED_UNKNOWN_UNVALIDATED"
+                if certificate_status == ocsp.OCSPCertStatus.GOOD:
+                    result["status"] = "REPORTED_GOOD_UNVALIDATED"
+                elif certificate_status == ocsp.OCSPCertStatus.REVOKED:
+                    result["status"] = "REPORTED_REVOKED_UNVALIDATED"
+                else:
+                    result["status"] = "REPORTED_UNKNOWN_UNVALIDATED"
 
         except ValueError as exc:
             if "private or restricted" in str(exc) or "localhost" in str(exc) or "scheme" in str(exc).lower():
@@ -442,8 +594,73 @@ class TLSScanner:
 
         return result
 
+    @staticmethod
+    def _recv_line(sock):
+        buf = bytearray()
+        while len(buf) < 4096:
+            ch = sock.recv(1)
+            if not ch:
+                break
+            buf.extend(ch)
+            if ch == b"\n":
+                break
+        return buf.decode("ascii", errors="replace")
+
+    @classmethod
+    def _read_smtp_reply(cls, sock):
+        lines = []
+        while True:
+            line = cls._recv_line(sock)
+            if not line:
+                break
+            lines.append(line)
+            if len(line) >= 4 and line[3] == " ":
+                break
+            if len(line) < 4:
+                break
+        return "".join(lines)
+
+    @classmethod
+    def _negotiate_starttls(cls, raw_sock, starttls):
+        proto = starttls.lower()
+        if proto == "smtp":
+            banner = cls._read_smtp_reply(raw_sock)
+            if not banner.startswith("220"):
+                raise OSError("Unexpected SMTP banner before STARTTLS")
+            raw_sock.sendall(b"EHLO uspector.local\r\n")
+            ehlo = cls._read_smtp_reply(raw_sock)
+            if "250" not in ehlo:
+                raise OSError("SMTP EHLO rejected before STARTTLS")
+            raw_sock.sendall(b"STARTTLS\r\n")
+            reply = cls._read_smtp_reply(raw_sock)
+            if not reply.startswith("220"):
+                raise OSError("SMTP server rejected STARTTLS")
+        elif proto == "imap":
+            banner = cls._recv_line(raw_sock)
+            if "OK" not in banner.upper():
+                raise OSError("Unexpected IMAP banner before STARTTLS")
+            raw_sock.sendall(b"a001 STARTTLS\r\n")
+            reply = cls._recv_line(raw_sock)
+            if "a001 OK" not in reply.upper():
+                raise OSError("IMAP server rejected STARTTLS")
+        elif proto == "ftp":
+            banner = cls._read_smtp_reply(raw_sock)
+            if not banner.startswith("220"):
+                raise OSError("Unexpected FTP banner before AUTH TLS")
+            raw_sock.sendall(b"AUTH TLS\r\n")
+            reply = cls._read_smtp_reply(raw_sock)
+            if not reply.startswith("234"):
+                raise OSError("FTP server rejected AUTH TLS")
+
     # ====== TLS Connection Inspection ======
-    def _inspect_connection(self, domain, port, context, connect_host=None):
+    def _inspect_connection(
+        self,
+        domain,
+        port,
+        context,
+        connect_host=None,
+        starttls=None,
+    ):
         """Open a TLS connection and collect certificate details."""
 
         target_host = connect_host or domain
@@ -456,6 +673,12 @@ class TLSScanner:
         )
 
         try:
+            if starttls:
+                self._negotiate_starttls(raw_sock, starttls)
+
+            has_chain_api = callable(
+                getattr(ssl.SSLSocket, "get_unverified_chain", None)
+            )
             with context.wrap_socket(
                 raw_sock,
                 server_hostname=server_hostname,
@@ -483,6 +706,7 @@ class TLSScanner:
                         tls_sock,
                         certificate,
                     ),
+                    "has_chain_api": has_chain_api,
                     "fingerprint": hashlib.sha256(cert_der).hexdigest().upper(),
                     "peer_ip": peer_ip,
                 }
@@ -494,7 +718,14 @@ class TLSScanner:
                 pass
 
     # ====== TLS Protocol Support ======
-    def _check_tls_protocol_support(self, domain, port=443, connect_host=None):
+    def _check_tls_protocol_support(
+        self,
+        domain,
+        port=443,
+        connect_host=None,
+        connect_hosts=None,
+        starttls=None,
+    ):
         """
         Probe TLS 1.0 through TLS 1.3.
 
@@ -503,7 +734,11 @@ class TLSScanner:
         """
 
         supported_versions = []
-        target_host = connect_host or domain
+        hosts = (
+            list(connect_hosts)
+            if connect_hosts
+            else [connect_host or domain]
+        )
         server_hostname = None if self._is_ip_literal(domain) else domain
 
         versions = [
@@ -514,52 +749,217 @@ class TLSScanner:
         ]
 
         for version_name, tls_version, expected in versions:
-            raw_sock = None
+            for target_host in hosts:
+                raw_sock = None
 
-            try:
-                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
+                try:
+                    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
 
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", DeprecationWarning)
-                    context.minimum_version = tls_version
-                    context.maximum_version = tls_version
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", DeprecationWarning)
+                        context.minimum_version = tls_version
+                        context.maximum_version = tls_version
 
-                if tls_version in (
-                    ssl.TLSVersion.TLSv1,
-                    ssl.TLSVersion.TLSv1_1,
-                ):
-                    context.set_ciphers("DEFAULT:@SECLEVEL=0")
+                    if tls_version in (
+                        ssl.TLSVersion.TLSv1,
+                        ssl.TLSVersion.TLSv1_1,
+                    ):
+                        context.set_ciphers("DEFAULT:@SECLEVEL=0")
 
-                raw_sock = socket.create_connection(
-                    (target_host, port),
-                    timeout=self.timeout,
-                )
+                    raw_sock = socket.create_connection(
+                        (target_host, port),
+                        timeout=self.timeout,
+                    )
 
-                with context.wrap_socket(
-                    raw_sock,
-                    server_hostname=server_hostname,
-                ) as tls_sock:
-                    negotiated = tls_sock.version()
+                    if starttls:
+                        self._negotiate_starttls(raw_sock, starttls)
 
-                    if negotiated == expected:
-                        supported_versions.append(version_name)
+                    with context.wrap_socket(
+                        raw_sock,
+                        server_hostname=server_hostname,
+                    ) as tls_sock:
+                        negotiated = tls_sock.version()
 
-            except (ssl.SSLError, OSError, ValueError):
-                pass
+                        if negotiated == expected:
+                            supported_versions.append(version_name)
+                    break
 
-            finally:
-                if raw_sock is not None:
-                    try:
-                        raw_sock.close()
-                    except OSError:
-                        pass
+                except ssl.SSLError:
+                    break
+                except (OSError, ValueError):
+                    continue
+
+                finally:
+                    if raw_sock is not None:
+                        try:
+                            raw_sock.close()
+                        except OSError:
+                            pass
 
         return supported_versions
 
+    def _probe_weak_ciphers(self, domain, port, hosts, starttls=None):
+        """Optionally probe whether the server accepts weak TLS 1.2 cipher classes."""
+        probes = [
+            ("RC4", "RC4:@SECLEVEL=0"),
+            ("3DES", "3DES:@SECLEVEL=0"),
+            ("NULL", "eNULL:@SECLEVEL=0"),
+            ("EXPORT", "EXP:@SECLEVEL=0"),
+            ("Static-RSA", "kRSA:!ECDHE:!DHE:@SECLEVEL=0"),
+        ]
+        accepted = []
+        server_hostname = None if self._is_ip_literal(domain) else domain
+
+        for label, cipher_spec in probes:
+            for target_host in hosts:
+                raw_sock = None
+                try:
+                    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", DeprecationWarning)
+                        context.maximum_version = ssl.TLSVersion.TLSv1_2
+                    context.set_ciphers(cipher_spec)
+
+                    raw_sock = socket.create_connection(
+                        (target_host, port),
+                        timeout=self.timeout,
+                    )
+                    if starttls:
+                        self._negotiate_starttls(raw_sock, starttls)
+
+                    with context.wrap_socket(
+                        raw_sock,
+                        server_hostname=server_hostname,
+                    ) as tls_sock:
+                        cipher = tls_sock.cipher()
+                        if cipher:
+                            accepted.append(f"{label} ({cipher[0]})")
+                    break
+                except ssl.SSLError:
+                    break
+                except (OSError, ValueError):
+                    continue
+                finally:
+                    if raw_sock is not None:
+                        try:
+                            raw_sock.close()
+                        except OSError:
+                            pass
+
+        return accepted
+
+    @staticmethod
+    def _check_certificate_hygiene(result, certificate):
+        """Inspect signature algorithm, constraints, EKU, SCT, and CRL fields."""
+        sig_hash = certificate.signature_hash_algorithm
+        if isinstance(sig_hash, (hashes.MD5, hashes.SHA1)):
+            result["findings"].append(
+                f"Weak certificate signature algorithm: {sig_hash.name.upper()}"
+            )
+
+        if result.get("certificate_trusted"):
+            validity_days = (
+                certificate.not_valid_after_utc - certificate.not_valid_before_utc
+            ).days
+            if validity_days > 398:
+                result["findings"].append(
+                    f"Certificate validity period exceeds 398 days ({validity_days} days)"
+                )
+
+        try:
+            bc = certificate.extensions.get_extension_for_class(
+                x509.BasicConstraints
+            ).value
+            if bc.ca:
+                result["findings"].append(
+                    "Leaf certificate has BasicConstraints CA=True"
+                )
+        except x509.ExtensionNotFound:
+            pass
+
+        try:
+            eku = certificate.extensions.get_extension_for_class(
+                x509.ExtendedKeyUsage
+            ).value
+            if ExtendedKeyUsageOID.SERVER_AUTH not in eku:
+                result["findings"].append(
+                    "Certificate ExtendedKeyUsage does not include serverAuth"
+                )
+        except x509.ExtensionNotFound:
+            pass
+
+        try:
+            sct_ext = certificate.extensions.get_extension_for_class(
+                x509.PrecertificateSignedCertificateTimestamps
+            ).value
+            result["has_sct"] = bool(len(sct_ext))
+        except x509.ExtensionNotFound:
+            result["has_sct"] = False
+
+        crl_urls = []
+        try:
+            cdp = certificate.extensions.get_extension_for_class(
+                x509.CRLDistributionPoints
+            ).value
+            for point in cdp:
+                for name in point.full_name or []:
+                    if isinstance(name, x509.UniformResourceIdentifier):
+                        crl_urls.append(name.value)
+        except x509.ExtensionNotFound:
+            pass
+        result["crl_urls"] = crl_urls
+
+    @staticmethod
+    def _check_certificate_chain_quality(result, certificate_chain, has_chain_api):
+        """Inspect presented intermediate certificates for completeness and hygiene."""
+        result["chain_length"] = len(certificate_chain)
+        result["chain_contains_root"] = any(
+            cert.subject == cert.issuer for cert in certificate_chain[1:]
+        )
+
+        if (
+            has_chain_api
+            and not result.get("self_signed")
+            and len(certificate_chain) < 2
+        ):
+            result["findings"].append(
+                "Server did not send intermediate certificate(s)"
+            )
+
+        now = datetime.now(timezone.utc)
+        for intermediate in certificate_chain[1:]:
+            if intermediate.subject == intermediate.issuer:
+                continue
+
+            if intermediate.not_valid_after_utc < now:
+                result["findings"].append(
+                    "Intermediate certificate in chain has expired"
+                )
+
+            sig_hash = intermediate.signature_hash_algorithm
+            if isinstance(sig_hash, (hashes.MD5, hashes.SHA1)):
+                result["findings"].append(
+                    f"Weak signature algorithm in intermediate certificate: {sig_hash.name.upper()}"
+                )
+
+            pub_key = intermediate.public_key()
+            if isinstance(pub_key, rsa.RSAPublicKey) and pub_key.key_size < 2048:
+                result["findings"].append(
+                    f"Weak RSA key in intermediate certificate: {pub_key.key_size} bits"
+                )
+
     # ====== TLS Check ======
-    def check_tls(self, domain, port=443):
+    def check_tls(
+        self,
+        domain,
+        port=443,
+        probe_weak_ciphers=False,
+        starttls=None,
+    ):
         """Scan a domain and return a structured dictionary of findings."""
 
         domain = self._normalize_domain(domain)
@@ -569,6 +969,15 @@ class TLSScanner:
 
         if not 1 <= port <= 65535:
             raise ValueError("port must be between 1 and 65535")
+
+        if starttls is not None:
+            if not isinstance(starttls, str) or starttls.lower() not in (
+                "smtp",
+                "imap",
+                "ftp",
+            ):
+                raise ValueError("starttls must be one of: smtp, imap, ftp")
+            starttls = starttls.lower()
 
         result = {
             "domain": domain,
@@ -585,6 +994,7 @@ class TLSScanner:
 
         certificate = None
         certificate_chain = []
+        has_chain_api = False
 
         # DNS resolution.
         try:
@@ -631,6 +1041,7 @@ class TLSScanner:
                         port,
                         tls_context,
                         connect_host=ip_addr,
+                        starttls=starttls,
                     )
                 except ssl.SSLError:
                     raise
@@ -667,6 +1078,7 @@ class TLSScanner:
 
             certificate = inspected["certificate_obj"]
             certificate_chain = inspected["certificate_chain"]
+            has_chain_api = inspected.get("has_chain_api", False)
 
         except ssl.SSLCertVerificationError as exc:
             result["ssl_error"] = str(exc)
@@ -879,28 +1291,55 @@ class TLSScanner:
                 )
 
             self._check_certificate_validity(result, certificate)
+            self._check_certificate_hygiene(result, certificate)
+            self._check_certificate_chain_quality(
+                result,
+                certificate_chain,
+                has_chain_api,
+            )
 
             result["ocsp"] = self._check_ocsp(
                 certificate,
                 certificate_chain,
+                certificate_trusted=result["certificate_trusted"],
             )
 
-            if result["ocsp"]["status"] == "REPORTED_REVOKED_UNVALIDATED":
+            ocsp_info = result["ocsp"]
+            ocsp_status = ocsp_info.get("status")
+            if ocsp_status == "REVOKED":
+                result["findings"].append(
+                    "OCSP responder reported the certificate as revoked"
+                )
+            elif ocsp_status == "REPORTED_REVOKED_UNVALIDATED":
                 result["findings"].append(
                     "OCSP responder reported the certificate as revoked; "
                     "the response has not been cryptographically validated"
                 )
+            elif ocsp_status == "Serial Mismatch":
+                result["findings"].append(
+                    "OCSP response serial number does not match certificate"
+                )
+
+            if ocsp_info.get("signature_valid") is False:
+                result["findings"].append(
+                    "OCSP response signature verification failed"
+                )
+            if ocsp_info.get("fresh") is False:
+                result["findings"].append("OCSP response has expired")
 
         # Probe TLS versions. Failed probes do not prove versions are disabled.
+        probe_hosts = [connected_ip] if connected_ip else result["resolved_ips"]
         result["supported_tls_versions"] = (
             self._check_tls_protocol_support(
                 domain,
                 port,
-                connect_host=connected_ip or result["resolved_ips"][0],
+                connect_hosts=probe_hosts,
+                starttls=starttls,
             )
         )
 
         supported_versions = result["supported_tls_versions"]
+        result["tls13_supported"] = "TLSv1.3" in supported_versions
 
         if "TLSv1.0" in supported_versions:
             result["findings"].append(
@@ -912,18 +1351,60 @@ class TLSScanner:
                 "Server supports deprecated TLSv1.1"
             )
 
+        if supported_versions and all(
+            ver in ("TLSv1.0", "TLSv1.1") for ver in supported_versions
+        ):
+            result["findings"].append(
+                "Server only supports deprecated TLS protocols"
+            )
+
         # Weak cipher suite indicators for the negotiated connection.
         cipher = result.get("cipher")
 
         if cipher:
             cipher_name = cipher[0].upper()
+            cipher_bits = cipher[2] if len(cipher) > 2 else None
+            negotiated_version = result.get("tls_version")
 
             if any(
                 weak_name in cipher_name
-                for weak_name in ("RC4", "3DES", "DES")
-            ):
+                for weak_name in (
+                    "RC4",
+                    "3DES",
+                    "DES",
+                    "NULL",
+                    "EXPORT",
+                    "ANON",
+                    "ADH",
+                    "AECDH",
+                    "MD5",
+                    "RC2",
+                )
+            ) or (isinstance(cipher_bits, int) and cipher_bits < 128):
                 result["findings"].append(
                     f"Weak TLS cipher suite: {cipher[0]}"
+                )
+            elif (
+                negotiated_version != "TLSv1.3"
+                and "ECDHE" not in cipher_name
+                and "DHE" not in cipher_name
+            ):
+                result["findings"].append(
+                    f"TLS cipher suite lacks forward secrecy: {cipher[0]}"
+                )
+
+        if probe_weak_ciphers:
+            weak_supported = self._probe_weak_ciphers(
+                domain,
+                port,
+                probe_hosts,
+                starttls=starttls,
+            )
+            result["weak_ciphers_supported"] = weak_supported
+            if weak_supported:
+                result["findings"].append(
+                    "Server accepts weak TLS 1.2 cipher suite(s): "
+                    + ", ".join(weak_supported)
                 )
 
         # Final verdict.

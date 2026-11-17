@@ -2,11 +2,76 @@
 
 import ipaddress
 import math
+import re
 import socket
 from urllib.parse import urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
+
+
+def extract_set_cookie_headers(response):
+    """Extract individual Set-Cookie header strings from a requests Response."""
+    raw_headers = getattr(
+        getattr(response, "raw", None),
+        "headers",
+        None,
+    )
+
+    if raw_headers is not None and hasattr(raw_headers, "getlist"):
+        values = raw_headers.getlist("Set-Cookie")
+        if values:
+            return list(values)
+
+    headers = getattr(response, "headers", None) or {}
+    header_val = headers.get("Set-Cookie")
+    if not header_val or not isinstance(header_val, str):
+        return []
+
+    return [
+        item.strip()
+        for item in re.split(
+            r",\s*(?=[A-Za-z0-9!#$%&'*+.^_`|~-]+=)",
+            header_val,
+        )
+        if item.strip()
+    ]
+
+
+def parse_cookie_attributes(cookie_header):
+    """Parse name and security flags from one Set-Cookie header."""
+    parts = [part.strip() for part in cookie_header.split(";")]
+    if not parts or "=" not in parts[0]:
+        return None
+
+    name = parts[0].split("=", 1)[0].strip()
+    if not name:
+        return None
+
+    attr_map = {}
+    for part in parts[1:]:
+        if not part:
+            continue
+        if "=" in part:
+            attr_key, attr_val = part.split("=", 1)
+        else:
+            attr_key, attr_val = part, ""
+        attr_map[attr_key.strip().lower()] = attr_val.strip().lower()
+
+    is_secure = "secure" in attr_map
+    is_httponly = "httponly" in attr_map
+    samesite_val = attr_map.get("samesite")
+    is_samesite_valid = (
+        samesite_val in ("lax", "strict")
+        or (samesite_val == "none" and is_secure)
+    )
+
+    return {
+        "name": name,
+        "secure": is_secure,
+        "httponly": is_httponly,
+        "samesite": is_samesite_valid,
+    }
 
 
 def validate_timeout(timeout):

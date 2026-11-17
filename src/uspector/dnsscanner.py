@@ -11,6 +11,7 @@ DNSSEC records are inspected, not cryptographically validated.
 
 from __future__ import annotations
 
+import base64
 import ipaddress
 import os
 import secrets
@@ -751,6 +752,44 @@ class DNSScanner:
                 "value": f"{priority} {weight} {port} {clean_target}",
             })
 
+        elif rtype == 52 and rdlength >= 4:
+            usage, selector, matching_type = struct.unpack_from(
+                "!BBB", data, 0
+            )
+            cert_data = data[3:].hex()
+            record.update({
+                "usage": usage,
+                "selector": selector,
+                "matching_type": matching_type,
+                "certificate_data": cert_data,
+                "value": f"{usage} {selector} {matching_type} {cert_data}",
+            })
+
+        elif rtype in (64, 65) and rdlength >= 3:
+            priority = struct.unpack_from("!H", data, 0)[0]
+            target, pos = cls._decode_name(
+                packet, rstart + 2, max_wire_end=rend
+            )
+            if pos > rend:
+                raise ValueError("Malformed SVCB/HTTPS record.")
+
+            clean_target = cls._strip_trailing_dot(target)
+            svc_params: dict[int, str] = {}
+            while pos + 4 <= rend:
+                param_key, param_len = struct.unpack_from("!HH", packet, pos)
+                pos += 4
+                if pos + param_len > rend:
+                    raise ValueError("Malformed SVCB/HTTPS parameter.")
+                svc_params[param_key] = packet[pos:pos + param_len].hex()
+                pos += param_len
+
+            record.update({
+                "priority": priority,
+                "target": clean_target,
+                "params": svc_params,
+                "value": f"{priority} {clean_target}",
+            })
+
         else:
             record["rdata_hex"] = data.hex()
 
@@ -1042,11 +1081,335 @@ class DNSScanner:
 
         return "\n".join(lines)
 
+    @staticmethod
+    def _read_asn1_tlv(data: bytes, offset: int) -> tuple[int, bytes, int]:
+        if offset >= len(data):
+            raise ValueError("Truncated ASN.1 data.")
+        tag = data[offset]
+        offset += 1
+        if offset >= len(data):
+            raise ValueError("Truncated ASN.1 length.")
+        length = data[offset]
+        offset += 1
+        if length & 0x80:
+            num_bytes = length & 0x7F
+            if num_bytes == 0 or offset + num_bytes > len(data):
+                raise ValueError("Invalid ASN.1 length.")
+            length = int.from_bytes(data[offset:offset + num_bytes], "big")
+            offset += num_bytes
+        if offset + length > len(data):
+            raise ValueError("ASN.1 value extends past buffer.")
+        return tag, data[offset:offset + length], offset + length
+
+    @classmethod
+    def _rsa_bits_from_spki(cls, b64_key: str) -> int | None:
+        try:
+            der = base64.b64decode("".join(b64_key.split()), validate=True)
+            tag, spki, _ = cls._read_asn1_tlv(der, 0)
+            if tag != 0x30:
+                return None
+            alg_tag, alg_seq, pos = cls._read_asn1_tlv(spki, 0)
+            if alg_tag != 0x30:
+                return None
+            oid_tag, oid_bytes, _ = cls._read_asn1_tlv(alg_seq, 0)
+            # RSA encryption OID 1.2.840.113549.1.1.1
+            if oid_tag != 0x06 or oid_bytes != b"\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01":
+                return None
+            bit_tag, bit_str, _ = cls._read_asn1_tlv(spki, pos)
+            if bit_tag != 0x03 or len(bit_str) < 2 or bit_str[0] != 0:
+                return None
+            rsa_tag, rsa_seq, _ = cls._read_asn1_tlv(bit_str[1:], 0)
+            if rsa_tag != 0x30:
+                return None
+            mod_tag, modulus, _ = cls._read_asn1_tlv(rsa_seq, 0)
+            if mod_tag != 0x02:
+                return None
+            modulus_int = int.from_bytes(modulus, "big")
+            return modulus_int.bit_length() or None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _evaluate_spf(spf_records: list[str]) -> tuple[int | None, list[str]]:
+        if len(spf_records) != 1:
+            return None, []
+
+        findings: list[str] = []
+        terms = spf_records[0].lower().split()
+        mechanisms = terms[1:]
+        lookup_count = 0
+        has_redirect = False
+        has_all = False
+
+        for term in mechanisms:
+            if term.startswith("redirect="):
+                has_redirect = True
+                lookup_count += 1
+                continue
+
+            bare = term.lstrip("+-~?")
+            if bare == "all":
+                has_all = True
+                if term == "+all":
+                    findings.append("SPF record uses permissive '+all' policy")
+                elif term == "?all":
+                    findings.append("SPF record uses neutral '?all' policy")
+                continue
+
+            if bare == "ptr" or bare.startswith("ptr:"):
+                findings.append("SPF record uses deprecated 'ptr' mechanism")
+                lookup_count += 1
+            elif (
+                bare.startswith(("include:", "exists:"))
+                or bare in ("a", "mx")
+                or bare.startswith(("a:", "a/", "mx:", "mx/"))
+            ):
+                lookup_count += 1
+
+        if not has_all and not has_redirect:
+            findings.append(
+                "SPF record does not end with an 'all' or 'redirect' mechanism"
+            )
+
+        if lookup_count > 10:
+            findings.append(
+                f"SPF record exceeds the 10-DNS-lookup limit ({lookup_count})"
+            )
+        elif lookup_count >= 8:
+            findings.append(
+                f"SPF record approaches the 10-DNS-lookup limit ({lookup_count}/10)"
+            )
+
+        return lookup_count, findings
+
+    @staticmethod
+    def _evaluate_dmarc(
+        dmarc_records: list[str],
+        dmarc_tags: dict[str, str],
+    ) -> list[str]:
+        if len(dmarc_records) != 1:
+            return []
+
+        findings: list[str] = []
+        sp = (dmarc_tags.get("sp") or "").lower()
+        if sp == "none":
+            findings.append("DMARC subdomain policy (sp) is set to none")
+
+        pct_raw = dmarc_tags.get("pct")
+        if pct_raw is not None:
+            try:
+                pct_val = int(pct_raw)
+                if 0 <= pct_val < 100:
+                    findings.append(
+                        f"DMARC enforcement percentage (pct={pct_val}) is below 100%"
+                    )
+            except ValueError:
+                pass
+
+        if not dmarc_tags.get("rua") and not dmarc_tags.get("ruf"):
+            findings.append(
+                "DMARC record has no aggregate/forensic reporting URI (rua/ruf)"
+            )
+
+        return findings
+
+    @classmethod
+    def _evaluate_dkim(cls, dkim_records: list[str]) -> tuple[dict[str, Any], list[str]]:
+        if not dkim_records:
+            return {}, []
+
+        findings: list[str] = []
+        tags: dict[str, str] = {}
+        for item in dkim_records[0].split(";"):
+            if "=" in item:
+                k, v = item.split("=", 1)
+                tags[k.strip().lower()] = v.strip()
+
+        details: dict[str, Any] = {}
+        pub_key = tags.get("p", "")
+        if pub_key == "":
+            findings.append("DKIM key is revoked (empty p= tag)")
+            details["revoked"] = True
+        else:
+            bits = cls._rsa_bits_from_spki(pub_key)
+            if bits is not None:
+                details["rsa_bits"] = bits
+                if bits < 1024:
+                    findings.append(f"Weak DKIM RSA key: {bits} bits (< 1024)")
+                elif bits < 2048:
+                    findings.append(f"DKIM RSA key is below 2048 bits ({bits} bits)")
+
+        if "y" in (tags.get("t") or "").lower().split(":"):
+            findings.append("DKIM record is in test mode (t=y)")
+            details["test_mode"] = True
+
+        return details, findings
+
+    @staticmethod
+    def _evaluate_zone_records(
+        records: dict[str, Any],
+        include_dnssec: bool,
+    ) -> list[str]:
+        findings: list[str] = []
+
+        # CAA tags.
+        caa_records = [
+            record for record in records.get("CAA", {}).get("records", [])
+            if record.get("type", "CAA") == "CAA"
+        ]
+        if caa_records:
+            caa_tags = {
+                str(record.get("tag", "")).lower()
+                for record in caa_records
+            }
+            if "issue" not in caa_tags and "issuewild" not in caa_tags:
+                findings.append("CAA records do not specify 'issue' or 'issuewild'")
+            if "iodef" not in caa_tags:
+                findings.append("CAA records do not specify an 'iodef' reporting contact")
+
+        # NS redundancy.
+        ns_data = records.get("NS", {})
+        ns_records = [
+            record for record in ns_data.get("records", [])
+            if record.get("type", "NS") == "NS"
+        ]
+        if (
+            ns_data.get("status") in {"NOERROR", "NO_RECORDS"}
+            and len(ns_records) == 1
+        ):
+            findings.append("Single NS record found; redundant nameservers recommended")
+
+        # MX target hygiene.
+        for mx in records.get("MX", {}).get("records", []):
+            if mx.get("type", "MX") != "MX":
+                continue
+            exchange = mx.get("exchange", "")
+            if exchange and exchange != ".":
+                try:
+                    ipaddress.ip_address(exchange)
+                    findings.append(
+                        f"MX target {exchange} appears to be an IP address"
+                    )
+                except ValueError:
+                    pass
+
+        # SOA timer sanity.
+        for soa in records.get("SOA", {}).get("records", []):
+            if soa.get("type", "SOA") != "SOA":
+                continue
+            refresh = soa.get("refresh")
+            retry = soa.get("retry")
+            expire = soa.get("expire")
+            if isinstance(refresh, int) and isinstance(retry, int) and retry >= refresh:
+                findings.append(
+                    "SOA retry timer is greater than or equal to refresh"
+                )
+            if isinstance(expire, int) and expire < 604800:
+                findings.append("SOA expire timer is below 7 days")
+
+        # DNSSEC algorithm & signature expiration.
+        if include_dnssec:
+            deprecated_algs = {1, 3, 5, 6, 7}
+            for dnskey in records.get("DNSKEY", {}).get("records", []):
+                alg = dnskey.get("algorithm")
+                if alg in deprecated_algs:
+                    findings.append(
+                        f"Deprecated DNSSEC DNSKEY algorithm detected ({alg})"
+                    )
+                    break
+
+            now_ts = int(time.time())
+            for rrsig in records.get("RRSIG", {}).get("records", []):
+                exp = rrsig.get("expiration")
+                if isinstance(exp, int):
+                    if exp < now_ts:
+                        findings.append("Expired DNSSEC RRSIG signature detected")
+                        break
+                    if exp - now_ts < 86400:
+                        findings.append(
+                            "DNSSEC RRSIG signature expires within 24 hours"
+                        )
+                        break
+
+        return findings
+
+    def _run_extended_checks(
+        self,
+        domain: str,
+        records: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[str]]:
+        extra: dict[str, Any] = {}
+        findings: list[str] = []
+
+        # Optional email transport & brand indicators.
+        mta_sts = self.query(f"_mta-sts.{domain}", "TXT")
+        mta_sts_found = any(
+            isinstance(r.get("value"), str) and r["value"].startswith("v=STSv1")
+            for r in mta_sts.get("records", [])
+        )
+        tls_rpt = self.query(f"_smtp._tls.{domain}", "TXT")
+        tls_rpt_found = any(
+            isinstance(r.get("value"), str) and r["value"].startswith("v=TLSRPTv1")
+            for r in tls_rpt.get("records", [])
+        )
+        bimi = self.query(f"default._bimi.{domain}", "TXT")
+        bimi_found = any(
+            isinstance(r.get("value"), str) and r["value"].startswith("v=BIMI1")
+            for r in bimi.get("records", [])
+        )
+        extra["email_transport"] = {
+            "mta_sts_found": mta_sts_found,
+            "tls_rpt_found": tls_rpt_found,
+            "bimi_found": bimi_found,
+        }
+
+        # Optional service/DANE/NSEC records (no failure findings if unsupported).
+        for label, qname, qtype in (
+            ("TLSA", f"_443._tcp.{domain}", "TLSA"),
+            ("HTTPS", domain, "HTTPS"),
+            ("SVCB", domain, "SVCB"),
+            ("NSEC", domain, "NSEC"),
+            ("NSEC3", domain, "NSEC3"),
+        ):
+            extra[label] = self.query(qname, qtype)
+
+        if extra["NSEC"].get("records"):
+            findings.append("DNSSEC NSEC record present (zone enumeration possible)")
+
+        # Dangling CNAME check.
+        for cname in records.get("CNAME", {}).get("records", []):
+            target = cname.get("value")
+            if isinstance(target, str) and target and target != ".":
+                a_res = self.query(target, "A")
+                aaaa_res = self.query(target, "AAAA")
+                if a_res.get("status") == "NXDOMAIN" and aaaa_res.get("status") == "NXDOMAIN":
+                    findings.append(
+                        f"Dangling CNAME target {target} resolves to NXDOMAIN"
+                    )
+
+        # FCrDNS check on first resolved A/AAAA IP.
+        fcrdns: list[dict[str, Any]] = []
+        for rtype in ("A", "AAAA"):
+            for rec in records.get(rtype, {}).get("records", [])[:1]:
+                ip_val = rec.get("value")
+                if isinstance(ip_val, str):
+                    ptr_res = self.reverse_lookup(ip_val)
+                    ptrs = [
+                        p.get("value")
+                        for p in ptr_res.get("records", [])
+                        if p.get("type") == "PTR" and p.get("value")
+                    ]
+                    fcrdns.append({"ip": ip_val, "ptrs": ptrs})
+        extra["fcrdns"] = fcrdns
+
+        return extra, findings
+
     def scan(
         self,
         target: str,
         dkim_selector: str | None = None,
         include_dnssec: bool = True,
+        check_extended: bool = False,
     ) -> dict[str, Any]:
         """Scan DNS configuration and return structured results."""
         result: dict[str, Any] = {
@@ -1148,6 +1511,8 @@ class DNSScanner:
                 else []
             )
 
+            spf_lookup_count, spf_extra_findings = self._evaluate_spf(spf_records)
+
             spf = {
                 "status": "FOUND" if spf_records else "MISSING",
                 "records": spf_records,
@@ -1157,9 +1522,10 @@ class DNSScanner:
                         "+all", "-all", "~all", "?all",
                     }
                 ),
+                "lookup_count": spf_lookup_count,
                 "note": (
-                    "Basic SPF record discovery only; full SPF syntax "
-                    "and policy evaluation are not performed."
+                    "Passive SPF policy inspection; external include targets "
+                    "are not recursively resolved."
                 ),
             }
 
@@ -1176,6 +1542,8 @@ class DNSScanner:
                 result["findings"].append(
                     "Multiple SPF records detected"
                 )
+
+            result["findings"].extend(spf_extra_findings)
 
             # DMARC.
             dmarc_result = self.query(
@@ -1247,6 +1615,10 @@ class DNSScanner:
                     "DMARC policy is set to none"
                 )
 
+            result["findings"].extend(
+                self._evaluate_dmarc(dmarc_records, dmarc_tags)
+            )
+
             # Optional DKIM selector.
             if dkim_selector is not None:
                 selector = dkim_selector.strip().rstrip(".")
@@ -1286,12 +1658,17 @@ class DNSScanner:
                         )
                     ]
 
+                    dkim_details, dkim_extra_findings = self._evaluate_dkim(
+                        dkim_records
+                    )
+
                     result["email_security"]["dkim"] = {
                         "status": (
                             "FOUND" if dkim_records else "NOT_FOUND"
                         ),
                         "records": dkim_records,
                         "query": dkim_result,
+                        **dkim_details,
                     }
 
                     if (
@@ -1302,6 +1679,8 @@ class DNSScanner:
                         result["findings"].append(
                             "DKIM record not found for supplied selector"
                         )
+
+                    result["findings"].extend(dkim_extra_findings)
 
             # DNSSEC inspection, not cryptographic validation.
             if include_dnssec:
@@ -1347,6 +1726,26 @@ class DNSScanner:
                 in {"NOERROR", "NO_RECORDS"}
             ):
                 result["findings"].append("No CAA records found")
+
+            is_null_mx = (
+                len(mx_records) == 1
+                and mx_records[0].get("preference") == 0
+                and mx_records[0].get("exchange") == "."
+            )
+            if is_null_mx:
+                result["email_security"]["null_mx"] = True
+
+            result["findings"].extend(
+                self._evaluate_zone_records(records, include_dnssec)
+            )
+
+            if check_extended:
+                extended_data, extended_findings = self._run_extended_checks(
+                    domain,
+                    records,
+                )
+                result["extended"] = extended_data
+                result["findings"].extend(extended_findings)
 
         except (ValueError, OSError, TypeError) as exc:
             result["error"] = str(exc)

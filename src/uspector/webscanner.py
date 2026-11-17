@@ -13,16 +13,28 @@ from html.parser import HTMLParser
 
 import requests
 
-from ._http import PinnedIPAdapter, validate_public_http_url, validate_timeout
+from ._http import (
+    PinnedIPAdapter,
+    extract_set_cookie_headers,
+    parse_cookie_attributes,
+    validate_public_http_url,
+    validate_timeout,
+)
 
 
 class WebScanner:
     MAX_REDIRECTS = 5
     MAX_RESPONSE_SIZE = 1024 * 1024
 
-    def __init__(self, timeout: float = 15.0, allow_private: bool = True):
+    def __init__(
+        self,
+        timeout: float = 15.0,
+        allow_private: bool = True,
+        check_metadata: bool = False,
+    ):
         self.timeout = validate_timeout(timeout)
         self.allow_private = bool(allow_private)
+        self.check_metadata = bool(check_metadata)
 
     @staticmethod
     def format_scan(result: dict) -> str:
@@ -187,7 +199,7 @@ class WebScanner:
 
                 if response.is_redirect or response.is_permanent_redirect:
                     location = response.headers.get("Location")
-                    cookie_headers = self._extract_set_cookie_headers(response)
+                    cookie_headers = extract_set_cookie_headers(response)
                     response.close()
 
                     if not location:
@@ -204,32 +216,6 @@ class WebScanner:
                 return
 
         raise ValueError("Maximum redirect limit exceeded.")
-
-    @staticmethod
-    def _extract_set_cookie_headers(response) -> list[str]:
-        raw_headers = getattr(
-            getattr(response, "raw", None),
-            "headers",
-            None,
-        )
-
-        if raw_headers is not None and hasattr(raw_headers, "getlist"):
-            values = raw_headers.getlist("Set-Cookie")
-            if values:
-                return list(values)
-
-        header_val = response.headers.get("Set-Cookie")
-        if not header_val or not isinstance(header_val, str):
-            return []
-
-        return [
-            item.strip()
-            for item in re.split(
-                r",\s*(?=[A-Za-z0-9!#$%&'*+.^_`|~-]+=)",
-                header_val,
-            )
-            if item.strip()
-        ]
 
     @staticmethod
     def _detect_charset(
@@ -279,6 +265,280 @@ class WebScanner:
 
         return "utf-8"
 
+    @staticmethod
+    def _audit_csp(csp_value: str, findings: list[str]) -> None:
+        directives: dict[str, list[str]] = {}
+        for part in csp_value.split(";"):
+            tokens = part.strip().split()
+            if tokens:
+                directives[tokens[0].lower()] = [t.lower() for t in tokens[1:]]
+
+        script_sources = directives.get("script-src", directives.get("default-src", []))
+        if "'unsafe-inline'" in script_sources:
+            findings.append("CSP allows 'unsafe-inline' scripts")
+        if "'unsafe-eval'" in script_sources:
+            findings.append("CSP allows 'unsafe-eval' scripts")
+        if "*" in script_sources:
+            findings.append("CSP allows wildcard '*' script source")
+        if "frame-ancestors" not in directives:
+            findings.append("CSP missing 'frame-ancestors' directive")
+        if "object-src" not in directives:
+            findings.append("CSP missing 'object-src' directive")
+
+    @classmethod
+    def _audit_security_headers(
+        cls,
+        headers,
+        final_url: str,
+        has_cookies: bool,
+        result: dict,
+    ) -> None:
+        header_names = (
+            "X-Content-Type-Options",
+            "X-Frame-Options",
+            "Content-Security-Policy",
+            "Referrer-Policy",
+            "Permissions-Policy",
+        )
+
+        for name in header_names:
+            value = headers.get(name)
+            result["security_headers"][name] = value
+
+            if value is None or not str(value).strip():
+                result["findings"].append(f"Missing security header: {name}")
+
+        xcto = headers.get("X-Content-Type-Options")
+        if xcto and str(xcto).strip().lower() != "nosniff":
+            result["findings"].append(
+                "Invalid X-Content-Type-Options header (expected 'nosniff')"
+            )
+
+        xfo = headers.get("X-Frame-Options")
+        if xfo and str(xfo).strip().upper() not in ("DENY", "SAMEORIGIN"):
+            result["findings"].append(
+                "Weak or non-standard X-Frame-Options header"
+            )
+
+        csp = headers.get("Content-Security-Policy")
+        if csp and str(csp).strip():
+            cls._audit_csp(str(csp), result["findings"])
+        elif headers.get("Content-Security-Policy-Report-Only"):
+            result["findings"].append(
+                "Content-Security-Policy is in report-only mode (not enforced)"
+            )
+
+        ref_policy = headers.get("Referrer-Policy")
+        if ref_policy and str(ref_policy).strip():
+            policies = [p.strip().lower() for p in str(ref_policy).split(",")]
+            if any(p in ("unsafe-url", "no-referrer-when-downgrade") for p in policies):
+                result["findings"].append(
+                    "Weak Referrer-Policy value configured"
+                )
+
+        # HSTS is an HTTP policy header, only meaningful on HTTPS.
+        final_scheme = urlparse(final_url).scheme.lower()
+        if final_scheme == "https":
+            value = headers.get("Strict-Transport-Security")
+            result["security_headers"]["Strict-Transport-Security"] = value
+
+            if value is None or not str(value).strip():
+                result["findings"].append(
+                    "Missing security header: Strict-Transport-Security"
+                )
+            else:
+                max_age_match = re.search(
+                    r"(?:^|;)\s*max-age\s*=\s*(\d+)",
+                    str(value),
+                    re.IGNORECASE,
+                )
+                if not max_age_match or int(max_age_match.group(1)) <= 0:
+                    result["findings"].append(
+                        "Insecure Strict-Transport-Security header: "
+                        "max-age is missing or zero"
+                    )
+                else:
+                    if int(max_age_match.group(1)) < 31536000:
+                        result["findings"].append(
+                            "HSTS max-age is below recommended 1 year (31536000 seconds)"
+                        )
+                    if "includesubdomains" not in str(value).lower():
+                        result["findings"].append(
+                            "HSTS header missing includeSubDomains directive"
+                        )
+        elif final_scheme == "http":
+            result["findings"].append(
+                "Target served over unencrypted HTTP (HSTS requires HTTPS)"
+            )
+
+        # Optional cross-origin isolation headers (record when present).
+        for iso_name in (
+            "Cross-Origin-Opener-Policy",
+            "Cross-Origin-Embedder-Policy",
+            "Cross-Origin-Resource-Policy",
+            "X-Permitted-Cross-Domain-Policies",
+        ):
+            iso_val = headers.get(iso_name)
+            if iso_val is not None:
+                result["security_headers"][iso_name] = iso_val
+                if (
+                    iso_name == "X-Permitted-Cross-Domain-Policies"
+                    and str(iso_val).strip().lower() == "all"
+                ):
+                    result["findings"].append(
+                        "Permissive X-Permitted-Cross-Domain-Policies: all"
+                    )
+
+        # Passive CORS & cache checks.
+        acao = (headers.get("Access-Control-Allow-Origin") or "").strip()
+        acac = (headers.get("Access-Control-Allow-Credentials") or "").strip().lower()
+        if acao == "*" and acac == "true":
+            result["findings"].append(
+                "Insecure CORS configuration: wildcard origin with credentials"
+            )
+
+        if has_cookies:
+            cache_ctrl = (headers.get("Cache-Control") or "").lower()
+            if "no-store" not in cache_ctrl and "private" not in cache_ctrl:
+                result["findings"].append(
+                    "Response sets cookies without Cache-Control: no-store or private"
+                )
+
+        # Server / technology version banner disclosure.
+        for banner_hdr in (
+            "Server",
+            "X-Powered-By",
+            "X-AspNet-Version",
+            "X-AspNetMvc-Version",
+        ):
+            banner_val = headers.get(banner_hdr)
+            if banner_val and re.search(r"[/ ]\d+(?:\.\d+)+", str(banner_val)):
+                result["findings"].append(
+                    f"Server technology version disclosed in {banner_hdr} header"
+                )
+
+    @staticmethod
+    def _audit_html_security(
+        seo_parser: "SEOHTMLParser",
+        final_url: str,
+        result: dict,
+    ) -> None:
+        parsed_final = urlparse(final_url)
+        final_scheme = parsed_final.scheme.lower()
+        final_netloc = parsed_final.netloc.lower()
+
+        if final_scheme == "https":
+            if seo_parser.mixed_active_urls:
+                result["findings"].append(
+                    f"Mixed active/form content over HTTP detected ({len(seo_parser.mixed_active_urls)})"
+                )
+            if seo_parser.mixed_passive_urls:
+                result["findings"].append(
+                    f"Mixed passive content (HTTP images) detected ({len(seo_parser.mixed_passive_urls)})"
+                )
+
+        missing_sri = 0
+        for res_url, has_integrity in seo_parser.external_sri_resources:
+            parsed_res = urlparse(urljoin(final_url, res_url))
+            if (
+                parsed_res.scheme.lower() in ("http", "https")
+                and parsed_res.netloc
+                and parsed_res.netloc.lower() != final_netloc
+                and not has_integrity
+            ):
+                missing_sri += 1
+        if missing_sri:
+            result["findings"].append(
+                f"{missing_sri} external script/stylesheet(s) missing Subresource Integrity (SRI)"
+            )
+
+        if seo_parser.unsafe_blank_links:
+            result["findings"].append(
+                f"{seo_parser.unsafe_blank_links} link(s) with target='_blank' missing rel='noopener'/'noreferrer'"
+            )
+
+        if seo_parser.has_password_input and (
+            final_scheme == "http" or seo_parser.insecure_password_form
+        ):
+            result["findings"].append(
+                "Password input served or submitted over unencrypted HTTP"
+            )
+
+    def _check_metadata_endpoints(
+        self,
+        original_target: str,
+        final_url: str,
+        result: dict,
+    ) -> None:
+        parsed_final = urlparse(final_url)
+        origin = f"{parsed_final.scheme}://{parsed_final.netloc}"
+
+        metadata: dict = {}
+
+        # 1. /.well-known/security.txt
+        try:
+            with self._open_response(f"{origin}/.well-known/security.txt") as (sec_resp, _):
+                if sec_resp.status_code == 200:
+                    sec_body = b"".join(sec_resp.iter_content(8192))[:65536].decode(
+                        "utf-8", errors="replace"
+                    )
+                    has_contact = bool(re.search(r"(?im)^Contact:", sec_body))
+                    exp_match = re.search(r"(?im)^Expires:\s*(.+)$", sec_body)
+                    metadata["security_txt"] = {
+                        "present": has_contact,
+                        "expires": exp_match.group(1).strip() if exp_match else None,
+                    }
+        except (ValueError, requests.RequestException, OSError):
+            pass
+
+        # 2. /robots.txt passive sensitive-disallow inspection
+        try:
+            with self._open_response(f"{origin}/robots.txt") as (rob_resp, _):
+                if rob_resp.status_code == 200:
+                    rob_body = b"".join(rob_resp.iter_content(8192))[:65536].decode(
+                        "utf-8", errors="replace"
+                    )
+                    disallows = re.findall(
+                        r"(?im)^Disallow:\s*(\S+)",
+                        rob_body,
+                    )
+                    sensitive = [
+                        p for p in disallows
+                        if any(
+                            kw in p.lower()
+                            for kw in ("admin", "backup", ".env", "phpinfo", "config")
+                        )
+                    ]
+                    metadata["robots_txt"] = {
+                        "present": True,
+                        "sensitive_disallows": sensitive,
+                    }
+                    if sensitive:
+                        result["findings"].append(
+                            "robots.txt references potentially sensitive disallowed paths"
+                        )
+        except (ValueError, requests.RequestException, OSError):
+            pass
+
+        # 3. HTTP -> HTTPS redirect enforcement check
+        parsed_orig = urlparse(original_target)
+        if parsed_orig.scheme.lower() == "http" or parsed_final.scheme.lower() == "https":
+            http_url = f"http://{parsed_final.netloc}/"
+            try:
+                with self._open_response(http_url) as (http_resp, _):
+                    if urlparse(http_resp.url or http_url).scheme.lower() != "https":
+                        result["findings"].append(
+                            "HTTP endpoint does not redirect to HTTPS"
+                        )
+                        metadata["https_redirect"] = False
+                    else:
+                        metadata["https_redirect"] = True
+            except (ValueError, requests.RequestException, OSError):
+                pass
+
+        if metadata:
+            result["metadata"] = metadata
+
     def scan(self, target: str) -> dict:
         """Scan an HTTP(S) endpoint and return structured results."""
         result = {
@@ -324,109 +584,27 @@ class WebScanner:
 
                 headers = response.headers
 
-                # HTTP security headers only. TLS checks remain in tlsscanner.
-                header_names = (
-                    "X-Content-Type-Options",
-                    "X-Frame-Options",
-                    "Content-Security-Policy",
-                    "Referrer-Policy",
-                    "Permissions-Policy",
-                )
-
-                for name in header_names:
-                    value = headers.get(name)
-                    result["security_headers"][name] = value
-
-                    if value is None or not str(value).strip():
-                        result["findings"].append(
-                            f"Missing security header: {name}"
-                        )
-
-                # HSTS is an HTTP policy header, only meaningful on HTTPS.
-                final_scheme = urlparse(final_url).scheme.lower()
-                if final_scheme == "https":
-                    value = headers.get("Strict-Transport-Security")
-                    result["security_headers"][
-                        "Strict-Transport-Security"
-                    ] = value
-
-                    if value is None or not str(value).strip():
-                        result["findings"].append(
-                            "Missing security header: "
-                            "Strict-Transport-Security"
-                        )
-                    else:
-                        max_age_match = re.search(
-                            r"(?:^|;)\s*max-age\s*=\s*(\d+)",
-                            str(value),
-                            re.IGNORECASE,
-                        )
-                        if (
-                            not max_age_match
-                            or int(max_age_match.group(1)) <= 0
-                        ):
-                            result["findings"].append(
-                                "Insecure Strict-Transport-Security header: "
-                                "max-age is missing or zero"
-                            )
-                elif final_scheme == "http":
-                    result["findings"].append(
-                        "Target served over unencrypted HTTP "
-                        "(HSTS requires HTTPS)"
-                    )
-
                 # Cookie attributes across redirect history and final response.
                 cookie_headers: list[str] = []
                 for item in history:
                     if isinstance(item, list):
                         cookie_headers.extend(item)
                     else:
-                        cookie_headers.extend(
-                            self._extract_set_cookie_headers(item)
-                        )
-                cookie_headers.extend(
-                    self._extract_set_cookie_headers(response)
-                )
+                        cookie_headers.extend(extract_set_cookie_headers(item))
+                cookie_headers.extend(extract_set_cookie_headers(response))
 
                 cookies_by_name: dict[str, dict] = {}
                 for cookie_header in cookie_headers:
-                    parts = [
-                        part.strip()
-                        for part in cookie_header.split(";")
-                    ]
-                    if not parts or "=" not in parts[0]:
-                        continue
+                    cookie_result = parse_cookie_attributes(cookie_header)
+                    if cookie_result:
+                        cookies_by_name[cookie_result["name"]] = cookie_result
 
-                    name = parts[0].split("=", 1)[0].strip()
-                    if not name:
-                        continue
-
-                    attr_map: dict[str, str] = {}
-                    for part in parts[1:]:
-                        if not part:
-                            continue
-                        if "=" in part:
-                            attr_key, attr_val = part.split("=", 1)
-                        else:
-                            attr_key, attr_val = part, ""
-                        attr_map[attr_key.strip().lower()] = (
-                            attr_val.strip().lower()
-                        )
-
-                    is_secure = "secure" in attr_map
-                    is_httponly = "httponly" in attr_map
-                    samesite_val = attr_map.get("samesite")
-                    is_samesite_valid = (
-                        samesite_val in ("lax", "strict")
-                        or (samesite_val == "none" and is_secure)
-                    )
-
-                    cookies_by_name[name] = {
-                        "name": name,
-                        "secure": is_secure,
-                        "httponly": is_httponly,
-                        "samesite": is_samesite_valid,
-                    }
+                self._audit_security_headers(
+                    headers,
+                    final_url,
+                    bool(cookies_by_name),
+                    result,
+                )
 
                 for cookie_result in cookies_by_name.values():
                     result["cookies"].append(cookie_result)
@@ -480,11 +658,26 @@ class WebScanner:
                         "sqlite error",
                         "postgresql error",
                         "odbc sql",
+                        "traceback (most recent call last):",
+                        "django.core.exceptions",
+                        "werkzeug.debug",
+                        "server error in '/' application",
+                        "whitelabel error page",
+                        "sourcemappingurl=",
                     )
 
                     for indicator in indicators:
                         if indicator in lower_text:
                             result["body_indicators"].append(indicator)
+
+                    private_ip_url_re = re.compile(
+                        r"https?://(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+                        r"192\.168\.\d{1,3}\.\d{1,3}|"
+                        r"172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b",
+                        re.IGNORECASE,
+                    )
+                    if private_ip_url_re.search(decoded_text):
+                        result["body_indicators"].append("internal-ip-url")
 
                     if result["body_indicators"]:
                         result["findings"].append(
@@ -494,6 +687,28 @@ class WebScanner:
                     if "text/html" in content_type:
                         seo_parser = SEOHTMLParser()
                         seo_parser.feed(decoded_text)
+
+                        if any(
+                            private_ip_url_re.search(c)
+                            or re.search(
+                                r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+                                r"192\.168\.\d{1,3}\.\d{1,3}|"
+                                r"172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b",
+                                c,
+                            )
+                            for c in seo_parser.comments
+                        ):
+                            if "internal-ip-comment" not in result["body_indicators"]:
+                                result["body_indicators"].append("internal-ip-comment")
+                            if (
+                                "Informational response-body indicators detected"
+                                not in result["findings"]
+                            ):
+                                result["findings"].append(
+                                    "Informational response-body indicators detected"
+                                )
+
+                        self._audit_html_security(seo_parser, final_url, result)
 
                         title = " ".join(
                             "".join(seo_parser.title).split()
@@ -584,6 +799,13 @@ class WebScanner:
 
                         result["seo"] = seo
 
+                if self.check_metadata:
+                    self._check_metadata_endpoints(
+                        target,
+                        final_url,
+                        result,
+                    )
+
         except (TypeError, ValueError, requests.RequestException, OSError) as exc:
             result["error"] = str(exc)
 
@@ -635,6 +857,14 @@ class SEOHTMLParser(HTMLParser):
         self._svg_depth = 0
         self._in_h1 = False
         self._current_h1 = []
+        self.mixed_active_urls = []
+        self.mixed_passive_urls = []
+        self.external_sri_resources = []
+        self.unsafe_blank_links = 0
+        self.has_password_input = False
+        self.insecure_password_form = False
+        self._current_form_insecure = False
+        self.comments = []
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
@@ -658,6 +888,40 @@ class SEOHTMLParser(HTMLParser):
             self.image_count += 1
             if "alt" not in attrs:
                 self.images_missing_alt += 1
+            src = (attrs.get("src") or "").strip()
+            if src.lower().startswith("http://"):
+                self.mixed_passive_urls.append(src)
+
+        elif tag == "script":
+            src = (attrs.get("src") or "").strip()
+            if src:
+                if src.lower().startswith("http://"):
+                    self.mixed_active_urls.append(src)
+                self.external_sri_resources.append((src, "integrity" in attrs))
+
+        elif tag == "iframe":
+            src = (attrs.get("src") or "").strip()
+            if src.lower().startswith("http://"):
+                self.mixed_active_urls.append(src)
+
+        elif tag == "a":
+            target_attr = (attrs.get("target") or "").strip().lower()
+            if target_attr == "_blank":
+                rel_tokens = set((attrs.get("rel") or "").lower().split())
+                if "noopener" not in rel_tokens and "noreferrer" not in rel_tokens:
+                    self.unsafe_blank_links += 1
+
+        elif tag == "form":
+            action = (attrs.get("action") or "").strip()
+            self._current_form_insecure = action.lower().startswith("http://")
+            if self._current_form_insecure:
+                self.mixed_active_urls.append(action)
+
+        elif tag == "input":
+            if (attrs.get("type") or "").strip().lower() == "password":
+                self.has_password_input = True
+                if self._current_form_insecure:
+                    self.insecure_password_form = True
 
         elif tag == "meta":
             name = (attrs.get("name") or "").strip().lower()
@@ -675,9 +939,17 @@ class SEOHTMLParser(HTMLParser):
 
         elif tag == "link":
             rel = (attrs.get("rel") or "").lower().split()
-            href = attrs.get("href")
+            href = (attrs.get("href") or "").strip()
             if "canonical" in rel and href and self.canonical_url is None:
-                self.canonical_url = href.strip()
+                self.canonical_url = href
+            if "stylesheet" in rel and href:
+                if href.lower().startswith("http://"):
+                    self.mixed_active_urls.append(href)
+                self.external_sri_resources.append((href, "integrity" in attrs))
+
+    def handle_comment(self, data):
+        if data:
+            self.comments.append(data)
 
     def handle_data(self, data):
         if self._in_title:
@@ -690,6 +962,9 @@ class SEOHTMLParser(HTMLParser):
 
         if tag == "svg" and self._svg_depth > 0:
             self._svg_depth -= 1
+
+        elif tag == "form":
+            self._current_form_insecure = False
 
         elif tag == "title" and self._in_title:
             self._in_title = False

@@ -191,6 +191,92 @@ class TestWebScanner(unittest.TestCase):
 
         self.assertIn("private or restricted", result["error"].lower())
 
+    @patch("uspector.webscanner.requests.get")
+    def test_extended_header_cors_html_and_body_security_checks(self, mock_get):
+        html = (
+            "<html><head>"
+            "<script src='https://cdn.example.net/app.js'></script>"
+            "<script src='http://insecure.example.net/legacy.js'></script>"
+            "</head><body>"
+            "<!-- internal host 192.168.10.20 -->"
+            "<img src='http://img.example.net/pic.png' alt='ok'>"
+            "<a href='https://other.example.net' target='_blank'>Out</a>"
+            "<form action='http://login.example.com/auth' method='post'>"
+            "<input type='password' name='pw'>"
+            "</form>"
+            "<script>//# sourceMappingURL=app.js.map</script>"
+            "</body></html>"
+        ).encode("utf-8")
+
+        resp = self._mock_response(
+            url="https://example.com/",
+            headers={
+                "Content-Type": "text/html; charset=utf-8",
+                "Server": "nginx/1.24.0",
+                "X-Content-Type-Options": "invalid",
+                "X-Frame-Options": "ALLOW-FROM https://evil.example",
+                "Content-Security-Policy": "default-src 'self' 'unsafe-inline' *",
+                "Referrer-Policy": "unsafe-url",
+                "Permissions-Policy": "geolocation=()",
+                "Strict-Transport-Security": "max-age=3600",
+                "Cross-Origin-Opener-Policy": "same-origin",
+                "X-Permitted-Cross-Domain-Policies": "all",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Credentials": "true",
+                "Cache-Control": "public, max-age=60",
+            },
+            body=html,
+        )
+        resp.raw.headers.getlist.return_value = ["sid=1; Secure; HttpOnly; SameSite=Lax"]
+        mock_get.return_value = resp
+
+        result = WebScanner().scan("https://example.com")
+        findings = result["findings"]
+        self.assertIn("CSP allows 'unsafe-inline' scripts", findings)
+        self.assertIn("CSP allows wildcard '*' script source", findings)
+        self.assertIn("CSP missing 'frame-ancestors' directive", findings)
+        self.assertIn("CSP missing 'object-src' directive", findings)
+        self.assertIn("Invalid X-Content-Type-Options header (expected 'nosniff')", findings)
+        self.assertIn("Weak or non-standard X-Frame-Options header", findings)
+        self.assertIn("Weak Referrer-Policy value configured", findings)
+        self.assertIn("HSTS max-age is below recommended 1 year (31536000 seconds)", findings)
+        self.assertIn("HSTS header missing includeSubDomains directive", findings)
+        self.assertEqual(result["security_headers"]["Cross-Origin-Opener-Policy"], "same-origin")
+        self.assertIn("Permissive X-Permitted-Cross-Domain-Policies: all", findings)
+        self.assertIn("Insecure CORS configuration: wildcard origin with credentials", findings)
+        self.assertIn("Response sets cookies without Cache-Control: no-store or private", findings)
+        self.assertIn("Server technology version disclosed in Server header", findings)
+        self.assertTrue(any("Mixed active/form content" in f for f in findings))
+        self.assertTrue(any("Mixed passive content" in f for f in findings))
+        self.assertTrue(any("Subresource Integrity (SRI)" in f for f in findings))
+        self.assertTrue(any("target='_blank'" in f for f in findings))
+        self.assertIn("Password input served or submitted over unencrypted HTTP", findings)
+        self.assertIn("sourcemappingurl=", result["body_indicators"])
+        self.assertIn("internal-ip-comment", result["body_indicators"])
+
+    @patch("uspector.webscanner.requests.get")
+    def test_opt_in_metadata_endpoints(self, mock_get):
+        main_resp = self._mock_response(url="https://example.com/", body=b"<html></html>")
+        sec_resp = self._mock_response(
+            url="https://example.com/.well-known/security.txt",
+            headers={"Content-Type": "text/plain"},
+            body=b"Contact: mailto:sec@example.com\nExpires: 2027-01-01T00:00:00Z\n",
+        )
+        rob_resp = self._mock_response(
+            url="https://example.com/robots.txt",
+            headers={"Content-Type": "text/plain"},
+            body=b"User-agent: *\nDisallow: /admin-panel\n",
+        )
+        http_resp = self._mock_response(url="http://example.com/", body=b"ok")
+        mock_get.side_effect = [main_resp, sec_resp, rob_resp, http_resp]
+
+        result = WebScanner(check_metadata=True).scan("https://example.com")
+        self.assertTrue(result["metadata"]["security_txt"]["present"])
+        self.assertEqual(result["metadata"]["robots_txt"]["sensitive_disallows"], ["/admin-panel"])
+        self.assertFalse(result["metadata"]["https_redirect"])
+        self.assertIn("robots.txt references potentially sensitive disallowed paths", result["findings"])
+        self.assertIn("HTTP endpoint does not redirect to HTTPS", result["findings"])
+
 
 if __name__ == "__main__":
     unittest.main()

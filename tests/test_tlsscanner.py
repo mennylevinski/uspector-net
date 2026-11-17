@@ -10,7 +10,8 @@ from unittest.mock import MagicMock, patch
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import AuthorityInformationAccessOID, NameOID
+from cryptography.x509 import ocsp
+from cryptography.x509.oid import AuthorityInformationAccessOID, ExtendedKeyUsageOID, NameOID
 
 from uspector import TLSScanner
 
@@ -217,6 +218,204 @@ class TestTLSScanner(unittest.TestCase):
             scanner._inspect_connection("1.1.1.1", 443, context)
 
         context.wrap_socket.assert_called_once_with(raw_sock, server_hostname=None)
+
+    def test_certificate_hygiene_chain_quality_cipher_and_protocol_posture(self):
+        ca_key = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Weak Int CA")])
+        root_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Root CA")])
+        intermediate_cert = (
+            x509.CertificateBuilder()
+            .subject_name(ca_name)
+            .issuer_name(root_name)
+            .public_key(ca_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=10))
+            .not_valid_after(now - datetime.timedelta(days=1))
+            .sign(ca_key, hashes.SHA256())
+        )
+
+        leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        leaf_cert = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "example.com")]))
+            .issuer_name(ca_name)
+            .public_key(leaf_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=500))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName("example.com")]), critical=False)
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), critical=False)
+            .add_extension(
+                x509.CRLDistributionPoints([
+                    x509.DistributionPoint(
+                        full_name=[x509.UniformResourceIdentifier("http://crl.example.test/ca.crl")],
+                        relative_name=None,
+                        reasons=None,
+                        crl_issuer=None,
+                    )
+                ]),
+                critical=False,
+            )
+            .sign(ca_key, hashes.SHA256())
+        )
+
+        class _WeakHashCertProxy:
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+
+            @property
+            def signature_hash_algorithm(self):
+                return hashes.SHA1()
+
+            def __getattr__(self, name):
+                return getattr(self._wrapped, name)
+
+        proxied_leaf = _WeakHashCertProxy(leaf_cert)
+        proxied_intermediate = _WeakHashCertProxy(intermediate_cert)
+
+        scanner = TLSScanner()
+        inspected = {
+            "tls_version": "TLSv1.2",
+            "cipher": ("AES256-GCM-SHA384", "TLSv1.2", 256),
+            "alpn": "http/1.1",
+            "certificate_obj": proxied_leaf,
+            "certificate_chain": [proxied_leaf, proxied_intermediate],
+            "has_chain_api": True,
+            "fingerprint": "BB",
+            "peer_ip": "93.184.216.34",
+        }
+        with (
+            patch(
+                "uspector.tlsscanner.socket.getaddrinfo",
+                return_value=[(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 443))],
+            ),
+            patch.object(scanner, "_inspect_connection", return_value=inspected),
+            patch.object(
+                scanner,
+                "_check_ocsp",
+                return_value={"status": "URL Not Available", "url": None, "response_validated": False},
+            ),
+            patch.object(scanner, "_check_tls_protocol_support", return_value=["TLSv1.0"]),
+        ):
+            result = scanner.check_tls("example.com")
+
+        findings = result["findings"]
+        self.assertIn("Weak certificate signature algorithm: SHA1", findings)
+        self.assertIn("Certificate validity period exceeds 398 days (501 days)", findings)
+        self.assertIn("Leaf certificate has BasicConstraints CA=True", findings)
+        self.assertIn("Certificate ExtendedKeyUsage does not include serverAuth", findings)
+        self.assertIn("Intermediate certificate in chain has expired", findings)
+        self.assertIn("Weak signature algorithm in intermediate certificate: SHA1", findings)
+        self.assertIn("Weak RSA key in intermediate certificate: 1024 bits", findings)
+        self.assertIn("Server only supports deprecated TLS protocols", findings)
+        self.assertIn("TLS cipher suite lacks forward secrecy: AES256-GCM-SHA384", findings)
+        self.assertEqual(result["crl_urls"], ["http://crl.example.test/ca.crl"])
+        self.assertFalse(result["has_sct"])
+        self.assertFalse(result["tls13_supported"])
+
+    def test_missing_intermediate_reported_only_when_chain_api_available(self):
+        issuer_cert, _ = self._build_cert(common_name="Test CA")
+        leaf_cert, _ = self._build_cert(
+            common_name="example.com",
+            san_dns=["example.com"],
+            issuer_name=issuer_cert.subject,
+        )
+        res_with_api = {"self_signed": False, "findings": []}
+        TLSScanner._check_certificate_chain_quality(res_with_api, [leaf_cert], has_chain_api=True)
+        self.assertIn("Server did not send intermediate certificate(s)", res_with_api["findings"])
+
+        res_without_api = {"self_signed": False, "findings": []}
+        TLSScanner._check_certificate_chain_quality(res_without_api, [leaf_cert], has_chain_api=False)
+        self.assertNotIn("Server did not send intermediate certificate(s)", res_without_api["findings"])
+
+    def test_ocsp_cryptographic_and_freshness_validation(self):
+        ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        issuer_cert, _ = self._build_cert(common_name="Test CA", key=ca_key)
+        leaf_cert, _ = self._build_cert(
+            common_name="example.com",
+            issuer_name=issuer_cert.subject,
+            aia_ocsp="http://ocsp.example.test/ocsp",
+            key=ca_key,
+        )
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        valid_ocsp = (
+            ocsp.OCSPResponseBuilder()
+            .add_response(
+                cert=leaf_cert,
+                issuer=issuer_cert,
+                algorithm=hashes.SHA1(),
+                cert_status=ocsp.OCSPCertStatus.GOOD,
+                this_update=now - datetime.timedelta(minutes=5),
+                next_update=now + datetime.timedelta(hours=12),
+                revocation_time=None,
+                revocation_reason=None,
+            )
+            .responder_id(ocsp.OCSPResponderEncoding.HASH, issuer_cert)
+            .sign(ca_key, hashes.SHA256())
+        )
+        scanner = TLSScanner()
+        with patch.object(
+            scanner,
+            "_fetch_public_http_bytes",
+            return_value=valid_ocsp.public_bytes(serialization.Encoding.DER),
+        ):
+            res_good = scanner._check_ocsp(
+                leaf_cert,
+                [leaf_cert, issuer_cert],
+                certificate_trusted=True,
+            )
+        self.assertEqual(res_good["status"], "GOOD")
+        self.assertTrue(res_good["response_validated"])
+        self.assertTrue(res_good["signature_valid"])
+        self.assertTrue(res_good["fresh"])
+
+        # Expired next_update & wrong signing key
+        other_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        other_cert, _ = self._build_cert(common_name="Rogue Responder", key=other_key)
+        stale_bad_sig = (
+            ocsp.OCSPResponseBuilder()
+            .add_response(
+                cert=leaf_cert,
+                issuer=issuer_cert,
+                algorithm=hashes.SHA1(),
+                cert_status=ocsp.OCSPCertStatus.GOOD,
+                this_update=now - datetime.timedelta(days=2),
+                next_update=now - datetime.timedelta(hours=1),
+                revocation_time=None,
+                revocation_reason=None,
+            )
+            .responder_id(ocsp.OCSPResponderEncoding.HASH, other_cert)
+            .sign(other_key, hashes.SHA256())
+        )
+        with patch.object(
+            scanner,
+            "_fetch_public_http_bytes",
+            return_value=stale_bad_sig.public_bytes(serialization.Encoding.DER),
+        ):
+            res_bad = scanner._check_ocsp(
+                leaf_cert,
+                [leaf_cert, issuer_cert],
+                certificate_trusted=True,
+            )
+        self.assertEqual(res_bad["status"], "REPORTED_GOOD_UNVALIDATED")
+        self.assertFalse(res_bad["response_validated"])
+        self.assertFalse(res_bad["signature_valid"])
+        self.assertFalse(res_bad["fresh"])
+
+    def test_starttls_validation_and_smtp_negotiation(self):
+        scanner = TLSScanner()
+        with self.assertRaises(ValueError):
+            scanner.check_tls("example.com", 25, starttls="ssh")
+
+        sock = MagicMock()
+        sock.recv.side_effect = [bytes([b]) for b in b"220 mail.example.com ESMTP\r\n250-OK\r\n250 STARTTLS\r\n220 Ready\r\n"]
+        TLSScanner._negotiate_starttls(sock, "smtp")
+        sent = b"".join(call.args[0] for call in sock.sendall.call_args_list)
+        self.assertIn(b"EHLO uspector.local\r\n", sent)
+        self.assertIn(b"STARTTLS\r\n", sent)
 
 # --- Output ---
 if __name__ == "__main__":

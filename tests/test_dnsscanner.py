@@ -1,9 +1,14 @@
 
 # Uspector – Copyright (c) 2026 Menahem Levinski
 
+import base64
 import struct
+import time
 import unittest
 from unittest.mock import MagicMock, patch
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from uspector import DNSScanner
 
@@ -168,6 +173,99 @@ class TestDNSScanner(unittest.TestCase):
             result.get("error") or result.get("findings") is not None,
             f"Unexpected result: {result}",
         )
+
+    def test_email_zone_and_dnssec_evaluations(self):
+        rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+        spki_der = rsa_key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        dkim_b64 = base64.b64encode(spki_der).decode("ascii")
+        spf_many = (
+            "v=spf1 ptr include:a.example include:b.example include:c.example "
+            "include:d.example include:e.example include:f.example include:g.example "
+            "include:h.example include:i.example include:j.example +all"
+        )
+
+        def fake_query(name, rtype="A", dnssec=True):
+            if name == "_dmarc.example.com" and rtype == "TXT":
+                return {
+                    "status": "NOERROR",
+                    "records": [{"type": "TXT", "value": "v=DMARC1; p=quarantine; sp=none; pct=50"}],
+                }
+            if name == "sel._domainkey.example.com" and rtype == "TXT":
+                return {
+                    "status": "NOERROR",
+                    "records": [{"type": "TXT", "value": f"v=DKIM1; t=y; p={dkim_b64}"}],
+                }
+            if rtype == "TXT":
+                return {"status": "NOERROR", "records": [{"type": "TXT", "value": spf_many}]}
+            if rtype == "NS":
+                return {"status": "NOERROR", "records": [{"type": "NS", "value": "ns1.example.com"}]}
+            if rtype == "MX":
+                return {"status": "NOERROR", "records": [{"type": "MX", "preference": 10, "exchange": "192.0.2.10"}]}
+            if rtype == "SOA":
+                return {"status": "NOERROR", "records": [{"type": "SOA", "refresh": 600, "retry": 600, "expire": 3600}]}
+            if rtype == "CAA":
+                return {"status": "NOERROR", "records": [{"type": "CAA", "tag": "contactemail", "value": "sec@example.com"}]}
+            if rtype == "DNSKEY":
+                return {"status": "NOERROR", "records": [{"type": "DNSKEY", "algorithm": 5}]}
+            if rtype == "RRSIG":
+                return {"status": "NOERROR", "records": [{"type": "RRSIG", "expiration": int(time.time()) - 10}]}
+            return {"status": "NO_RECORDS", "records": []}
+
+        scanner = DNSScanner(nameservers=["1.1.1.1"])
+        with patch.object(scanner, "query", side_effect=fake_query):
+            result = scanner.scan("example.com", dkim_selector="sel", include_dnssec=True)
+
+        findings = result["findings"]
+        self.assertIn("SPF record uses permissive '+all' policy", findings)
+        self.assertIn("SPF record uses deprecated 'ptr' mechanism", findings)
+        self.assertTrue(any("exceeds the 10-DNS-lookup limit" in f for f in findings))
+        self.assertIn("DMARC subdomain policy (sp) is set to none", findings)
+        self.assertIn("DMARC enforcement percentage (pct=50) is below 100%", findings)
+        self.assertIn("DMARC record has no aggregate/forensic reporting URI (rua/ruf)", findings)
+        self.assertIn("DKIM RSA key is below 2048 bits (1024 bits)", findings)
+        self.assertIn("DKIM record is in test mode (t=y)", findings)
+        self.assertIn("CAA records do not specify 'issue' or 'issuewild'", findings)
+        self.assertIn("CAA records do not specify an 'iodef' reporting contact", findings)
+        self.assertIn("Single NS record found; redundant nameservers recommended", findings)
+        self.assertIn("MX target 192.0.2.10 appears to be an IP address", findings)
+        self.assertIn("SOA retry timer is greater than or equal to refresh", findings)
+        self.assertIn("SOA expire timer is below 7 days", findings)
+        self.assertIn("Deprecated DNSSEC DNSKEY algorithm detected (5)", findings)
+        self.assertIn("Expired DNSSEC RRSIG signature detected", findings)
+
+    def test_parse_rr_tlsa_and_https_and_extended_checks(self):
+        name_wire = b"\x07example\x03com\x00"
+        tlsa_rdata = struct.pack("!BBB", 3, 1, 1) + b"\xaa\xbb"
+        tlsa_pkt = name_wire + struct.pack("!HHIH", 52, 1, 60, len(tlsa_rdata)) + tlsa_rdata
+        tlsa_rec, _ = DNSScanner._parse_rr(tlsa_pkt, 0)
+        self.assertEqual((tlsa_rec["usage"], tlsa_rec["selector"], tlsa_rec["matching_type"]), (3, 1, 1))
+
+        https_rdata = struct.pack("!H", 1) + b"\x00" + struct.pack("!HH", 1, 2) + b"h2"
+        https_pkt = name_wire + struct.pack("!HHIH", 65, 1, 60, len(https_rdata)) + https_rdata
+        https_rec, _ = DNSScanner._parse_rr(https_pkt, 0)
+        self.assertEqual(https_rec["priority"], 1)
+        self.assertEqual(https_rec["target"], ".")
+
+        def fake_query(name, rtype="A", dnssec=True):
+            if name == "example.com" and rtype == "CNAME":
+                return {"status": "NOERROR", "records": [{"type": "CNAME", "value": "dead.example.net"}]}
+            if name == "dead.example.net":
+                return {"status": "NXDOMAIN", "records": []}
+            if name == "_mta-sts.example.com" and rtype == "TXT":
+                return {"status": "NOERROR", "records": [{"type": "TXT", "value": "v=STSv1; id=1"}]}
+            if rtype == "A":
+                return {"status": "NOERROR", "records": [{"type": "A", "value": "93.184.216.34"}]}
+            return {"status": "NO_RECORDS", "records": []}
+
+        scanner = DNSScanner(nameservers=["1.1.1.1"])
+        with patch.object(scanner, "query", side_effect=fake_query):
+            result = scanner.scan("example.com", include_dnssec=False, check_extended=True)
+
+        self.assertTrue(result["extended"]["email_transport"]["mta_sts_found"])
+        self.assertIn("Dangling CNAME target dead.example.net resolves to NXDOMAIN", result["findings"])
 
 
 if __name__ == "__main__":

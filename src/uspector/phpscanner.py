@@ -9,7 +9,13 @@ from urllib.parse import urljoin, urlparse, urlunparse
 import requests
 from requests.structures import CaseInsensitiveDict
 
-from ._http import PinnedIPAdapter, validate_public_http_url, validate_timeout
+from ._http import (
+    PinnedIPAdapter,
+    extract_set_cookie_headers,
+    parse_cookie_attributes,
+    validate_public_http_url,
+    validate_timeout,
+)
 
 
 class PHPScanner:
@@ -23,11 +29,31 @@ class PHPScanner:
     PHP_ERROR_PATTERNS = [
         r"Fatal error:",
         r"Parse error:",
+        r"Catchable fatal error:",
         r"Warning:\s+.*\bin\s+.*\bon line\b",
         r"Notice:\s+.*\bin\s+.*\bon line\b",
+        r"Deprecated:\s+.*\bin\s+.*\bon line\b",
+        r"Strict Standards:\s+.*\bin\s+.*\bon line\b",
         r"Uncaught\s+\w+(?:Error|Exception)",
+        r"\bPDOException\b",
+        r"\bSQLSTATE\[[0-9A-Z]+\]",
+        r"\bmysqli_sql_exception\b",
+        r"open_basedir restriction in effect",
+        r"Call to undefined function",
+        r"Whoops! There was an error",
+        r"Symfony\\Component\\ErrorHandler",
         r"Stack trace:",
     ]
+
+    # Minimum supported PHP branch as of 2026-11 (8.1 security support ended Dec 2025).
+    MIN_SUPPORTED_PHP_BRANCH = (8, 2)
+
+    PHP_SESSION_COOKIES = (
+        "phpsessid",
+        "laravel_session",
+        "cakephp",
+        "symfony",
+    )
 
     PHPINFO_PATTERNS = [
         r"<title>phpinfo\(\)</title>",
@@ -48,6 +74,7 @@ class PHPScanner:
         "composer.json": "LOW",
         "composer.lock": "LOW",
         "php.ini": "MEDIUM",
+        ".user.ini": "MEDIUM",
         "phpinfo.php": "HIGH",
         "info.php": "HIGH",
         "test.php": "MEDIUM",
@@ -170,6 +197,7 @@ class PHPScanner:
                     "url": current_url,
                     "status_code": response.status_code,
                     "headers": CaseInsensitiveDict(response.headers),
+                    "set_cookie_headers": extract_set_cookie_headers(response),
                     "body": body,
                     "content_type": response.headers.get(
                         "Content-Type", ""
@@ -316,15 +344,115 @@ class PHPScanner:
                 )
             )
 
-        if filename == "php.ini":
+        if filename in ("php.ini", ".user.ini"):
             return bool(
                 re.search(
-                    r"(?m)^\s*(?:display_errors|expose_php|memory_limit)\s*=",
+                    r"(?m)^\s*(?:display_errors|expose_php|memory_limit|"
+                    r"allow_url_include|open_basedir|auto_prepend_file|"
+                    r"session\.cookie_httponly)\s*=",
                     response_body,
+                    re.IGNORECASE,
                 )
             )
 
         return True
+
+    @classmethod
+    def _is_eol_php_version(cls, version_str):
+        try:
+            parts = [int(p) for p in version_str.split(".")[:2]]
+            if len(parts) < 2:
+                return False
+            return tuple(parts) < cls.MIN_SUPPORTED_PHP_BRANCH
+        except (ValueError, AttributeError):
+            return False
+
+    @staticmethod
+    def _detect_framework(headers, body, cookie_names):
+        lowered_cookies = {name.lower() for name in cookie_names}
+        if "laravel_session" in lowered_cookies:
+            return "Laravel"
+        if "cakephp" in lowered_cookies:
+            return "CakePHP"
+        if "symfony" in lowered_cookies:
+            return "Symfony"
+        if any(name.startswith("wordpress_logged_in_") for name in lowered_cookies):
+            return "WordPress"
+
+        if headers.get("X-Drupal-Cache") or headers.get("X-Drupal-Dynamic-Cache"):
+            return "Drupal"
+        if "wordpress" in (headers.get("X-Redirect-By") or "").lower():
+            return "WordPress"
+
+        gen_match = re.search(
+            r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']([^"\']+)["\']',
+            body[:8192],
+            re.IGNORECASE,
+        )
+        if gen_match:
+            gen_val = gen_match.group(1)
+            for fw in ("WordPress", "Drupal", "Joomla", "Magento", "TYPO3"):
+                if fw.lower() in gen_val.lower():
+                    return fw
+
+        return None
+
+    @staticmethod
+    def _inspect_ini_findings(filename, response_body, findings):
+        directives = {}
+        for line in response_body.splitlines():
+            stripped = line.split(";", 1)[0].strip()
+            if "=" not in stripped:
+                continue
+            k, v = stripped.split("=", 1)
+            directives[k.strip().lower()] = v.strip().strip("\"'").lower()
+
+        if directives.get("allow_url_include") in ("1", "on", "true", "yes"):
+            PHPScanner._add_finding(
+                findings,
+                "HIGH",
+                f"Dangerous PHP Setting in {filename}: allow_url_include",
+                f"{filename} enables allow_url_include, increasing remote file inclusion risk.",
+                "Set allow_url_include = Off and restrict public access to INI files.",
+            )
+
+        if directives.get("display_errors") in ("1", "on", "true", "yes"):
+            PHPScanner._add_finding(
+                findings,
+                "MEDIUM",
+                f"Verbose Errors Enabled in {filename}: display_errors",
+                f"{filename} configures display_errors = On.",
+                "Set display_errors = Off in production and log errors server-side.",
+            )
+
+        if directives.get("session.cookie_httponly") in ("0", "off", "false", "no"):
+            PHPScanner._add_finding(
+                findings,
+                "MEDIUM",
+                f"Insecure Session Setting in {filename}: session.cookie_httponly",
+                f"{filename} disables HttpOnly on PHP session cookies.",
+                "Enable session.cookie_httponly = 1.",
+            )
+
+    @staticmethod
+    def _inspect_composer_findings(response_body, findings):
+        try:
+            data = json.loads(response_body)
+        except (ValueError, TypeError):
+            return
+
+        if not isinstance(data, dict):
+            return
+
+        require_dev = data.get("require-dev")
+        if isinstance(require_dev, dict) and require_dev:
+            PHPScanner._add_finding(
+                findings,
+                "LOW",
+                "Composer Development Dependencies Exposed",
+                f"composer.json lists {len(require_dev)} require-dev package(s).",
+                "Block public access to composer.json and avoid deploying dev metadata.",
+            )
 
     # --------------------------------------------------
     # Findings
@@ -351,6 +479,7 @@ class PHPScanner:
             "php_detected": False,
             "php_version": None,
             "detection_method": None,
+            "framework": None,
             "server_software": None,
             "version_disclosure": False,
             "phpinfo_exposure": False,
@@ -381,11 +510,22 @@ class PHPScanner:
 
                 headers = main_response["headers"]
                 body = main_response["body"]
+                set_cookie_headers = main_response.get("set_cookie_headers") or []
+
+                parsed_cookies = []
+                for cookie_hdr in set_cookie_headers:
+                    parsed_cookie = parse_cookie_attributes(cookie_hdr)
+                    if parsed_cookie:
+                        parsed_cookies.append(parsed_cookie)
+                cookie_names = [c["name"] for c in parsed_cookies]
 
                 powered_by = headers.get("X-Powered-By", "")
                 server = headers.get("Server", "")
 
                 result["server_software"] = server or None
+                framework = self._detect_framework(headers, body, cookie_names)
+                if framework:
+                    result["framework"] = framework
 
                 php_version, version_method = self._detect_php_version(
                     headers,
@@ -402,9 +542,20 @@ class PHPScanner:
                     result["php_detected"] = True
                     result["detection_method"] = "X-Powered-By"
 
-                elif "PHPSESSID" in headers.get("Set-Cookie", ""):
+                elif any(
+                    name.lower() in self.PHP_SESSION_COOKIES
+                    for name in cookie_names
+                ) or "PHPSESSID" in headers.get("Set-Cookie", ""):
                     result["php_detected"] = True
-                    result["detection_method"] = "PHP Session Cookie"
+                    result["detection_method"] = (
+                        "PHP Session Cookie"
+                        if any(n.lower() == "phpsessid" for n in cookie_names)
+                        or "PHPSESSID" in headers.get("Set-Cookie", "")
+                        else "PHP Framework Session Cookie"
+                    )
+                elif framework:
+                    result["php_detected"] = True
+                    result["detection_method"] = f"Framework Signature ({framework})"
 
                 if result["version_disclosure"]:
                     self._add_finding(
@@ -414,6 +565,37 @@ class PHPScanner:
                         f"The server disclosed PHP version {php_version}.",
                         "Remove PHP version information from HTTP response headers.",
                     )
+                    if self._is_eol_php_version(php_version):
+                        self._add_finding(
+                            result["findings"],
+                            "MEDIUM",
+                            f"End-of-Life PHP Version: {php_version}",
+                            f"PHP {php_version} belongs to an end-of-life branch without security updates.",
+                            "Upgrade to an actively supported PHP release branch.",
+                        )
+
+                for cookie in parsed_cookies:
+                    if cookie["name"].lower() in self.PHP_SESSION_COOKIES:
+                        missing_flags = [
+                            flag
+                            for flag, ok in (
+                                ("Secure", cookie["secure"]),
+                                ("HttpOnly", cookie["httponly"]),
+                                ("SameSite", cookie["samesite"]),
+                            )
+                            if not ok
+                        ]
+                        if missing_flags:
+                            self._add_finding(
+                                result["findings"],
+                                "MEDIUM",
+                                f"Insecure PHP Session Cookie: {cookie['name']}",
+                                (
+                                    f"Session cookie {cookie['name']!r} is missing "
+                                    f"recommended attributes: {', '.join(missing_flags)}."
+                                ),
+                                "Set Secure, HttpOnly, and SameSite attributes on PHP session cookies.",
+                            )
 
                 main_phpinfo = self._is_phpinfo(body)
                 if main_phpinfo:
@@ -507,6 +689,14 @@ class PHPScanner:
                                     f"The server disclosed PHP version {probe_version}.",
                                     "Remove PHP version information from HTTP response headers.",
                                 )
+                                if self._is_eol_php_version(probe_version):
+                                    self._add_finding(
+                                        result["findings"],
+                                        "MEDIUM",
+                                        f"End-of-Life PHP Version: {probe_version}",
+                                        f"PHP {probe_version} belongs to an end-of-life branch without security updates.",
+                                        "Upgrade to an actively supported PHP release branch.",
+                                    )
 
                         result["exposed_files"].append({
                             "file": filename,
@@ -521,6 +711,18 @@ class PHPScanner:
                             f"The file {filename} appears to be publicly accessible.",
                             "Restrict access to sensitive files and remove unnecessary public backups.",
                         )
+
+                        if filename in ("php.ini", ".user.ini"):
+                            self._inspect_ini_findings(
+                                filename,
+                                response_body,
+                                result["findings"],
+                            )
+                        elif filename == "composer.json":
+                            self._inspect_composer_findings(
+                                response_body,
+                                result["findings"],
+                            )
 
                     except (requests.RequestException, ValueError):
                         continue

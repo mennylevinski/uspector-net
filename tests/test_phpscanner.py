@@ -225,6 +225,64 @@ class TestPHPScanner(unittest.TestCase):
             sent_request = mock_send.call_args.args[0]
             self.assertEqual(sent_request.headers["Host"], "example.com")
 
+    def test_eol_php_session_cookie_framework_errors_ini_and_composer_checks(self):
+        scanner = PHPScanner()
+        session = MagicMock()
+        session.__enter__.return_value = session
+        session.__exit__.return_value = False
+
+        main_resp = self._mock_http_response(
+            status_code=200,
+            headers={
+                "X-Powered-By": "PHP/7.4.33",
+                "Content-Type": "text/html",
+                "Set-Cookie": "laravel_session=xyz; Path=/",
+            },
+            body=b"<html><body>SQLSTATE[42000]: Syntax error in PDOException</body></html>",
+        )
+        main_resp.raw.headers.getlist.return_value = ["laravel_session=xyz; Path=/"]
+
+        user_ini_resp = self._mock_http_response(
+            status_code=200,
+            headers={"Content-Type": "text/plain"},
+            body=b"allow_url_include = On\ndisplay_errors = On\n",
+        )
+        composer_resp = self._mock_http_response(
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            body=b'{"name": "app/site", "require": {"php": "^7.4"}, "require-dev": {"phpunit/phpunit": "^9.0"}}',
+        )
+
+        def fake_get(url, **kwargs):
+            if url == "https://example.com/":
+                return main_resp
+            if url.endswith("/.user.ini"):
+                return user_ini_resp
+            if url.endswith("/composer.json"):
+                return composer_resp
+            return self._mock_http_response(status_code=404)
+
+        session.get.side_effect = fake_get
+
+        with (
+            patch("uspector.phpscanner.requests.Session", return_value=session),
+            patch(
+                "uspector.phpscanner.socket.getaddrinfo",
+                return_value=[(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 443))],
+            ),
+        ):
+            result = scanner.scan("https://example.com/")
+
+        titles = [f["title"] for f in result["findings"]]
+        self.assertEqual(result["framework"], "Laravel")
+        self.assertTrue(result["php_error_disclosure"])
+        self.assertIn("End-of-Life PHP Version: 7.4.33", titles)
+        self.assertIn("Insecure PHP Session Cookie: laravel_session", titles)
+        self.assertIn("Dangerous PHP Setting in .user.ini: allow_url_include", titles)
+        self.assertIn("Verbose Errors Enabled in .user.ini: display_errors", titles)
+        self.assertIn("Composer Development Dependencies Exposed", titles)
+        self.assertEqual(result["verdict"], "HIGH RISK")
+
 
 if __name__ == "__main__":
     unittest.main()
