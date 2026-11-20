@@ -279,7 +279,7 @@ A reported missing DNS record, security header, or PHP indicator is an observati
 
 ## Responsible Use
 
-Only scan systems and websites you own or are authorized to assess.
+Uspector is intended for legitimate diagnostic, educational, troubleshooting, and defensive security purposes.
 
 DNS, TLS, web, and PHP diagnostic results are informational and should be validated before making security decisions.
 
