@@ -240,6 +240,56 @@ class TestCLI(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertIn("command", stderr.lower())
 
+    @patch("uspector.cli.WebScanner")
+    @patch("uspector.cli.TLSScanner")
+    @patch("uspector.cli.DNSScanner")
+    def test_extended_cli_flags(self, mock_dns_cls, mock_tls_cls, mock_web_cls):
+        mock_dns_cls.return_value.scan.return_value = {"target": "example.com", "error": None}
+        mock_dns_cls.return_value.format_scan.return_value = "DNS ok"
+        code, _, _ = self.run_cli(["dns", "example.com", "-t", "4", "--no-extended"])
+        self.assertEqual(code, 0)
+        mock_dns_cls.assert_called_once_with(timeout=4.0)
+        mock_dns_cls.return_value.scan.assert_called_once_with(
+            "example.com",
+            dkim_selector=None,
+            include_dnssec=True,
+            check_extended=False,
+        )
+
+        mock_tls_cls.return_value.check_tls.return_value = {"domain": "example.com", "error": None}
+        mock_tls_cls.return_value.format_scan.return_value = "TLS ok"
+        code, _, _ = self.run_cli([
+            "tls",
+            "example.com",
+            "-p",
+            "587",
+            "--starttls",
+            "smtp",
+            "--probe-weak-ciphers",
+        ])
+        self.assertEqual(code, 0)
+        mock_tls_cls.return_value.check_tls.assert_called_once_with(
+            "example.com",
+            587,
+            starttls="smtp",
+            probe_weak_ciphers=True,
+        )
+
+        mock_web_cls.return_value.scan.return_value = {"target": "https://example.com", "error": None}
+        mock_web_cls.return_value.format_scan.return_value = "Web ok"
+        code, _, _ = self.run_cli([
+            "web",
+            "https://example.com",
+            "--no-private",
+            "--check-metadata",
+        ])
+        self.assertEqual(code, 0)
+        mock_web_cls.assert_called_once_with(
+            timeout=15.0,
+            allow_private=False,
+            check_metadata=True,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

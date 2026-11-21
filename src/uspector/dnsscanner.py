@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import ipaddress
+import math
 import os
 import secrets
 import socket
@@ -42,9 +43,22 @@ class DNSScanner:
         retries: int = 2,
         port: int = 53,
     ) -> None:
-        self.timeout = max(0.1, float(timeout))
-        self.retries = max(1, int(retries))
-        self.port = int(port)
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise TypeError("timeout must be a positive number")
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be a finite positive number")
+        if isinstance(retries, bool) or not isinstance(retries, int):
+            raise TypeError("retries must be a positive integer")
+        if retries < 1:
+            raise ValueError("retries must be a positive integer")
+        if isinstance(port, bool) or not isinstance(port, int):
+            raise TypeError("port must be an integer between 1 and 65535")
+        if not (1 <= port <= 65535):
+            raise ValueError("port must be between 1 and 65535")
+
+        self.timeout = float(timeout)
+        self.retries = retries
+        self.port = port
 
         if nameservers is None:
             self.nameservers = self._discover_nameservers() or ["1.1.1.1"]
@@ -426,13 +440,15 @@ class DNSScanner:
         with socket.socket(
             family, socket.SOCK_DGRAM
         ) as sock:
+            sock.settimeout(self.timeout)
+            sock.sendto(query, sockaddr)
+
             while True:
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0:
                     raise TimeoutError("Timed out waiting for DNS response.")
 
                 sock.settimeout(remaining)
-                sock.sendto(query, sockaddr)
                 packet, source = sock.recvfrom(65535)
 
                 if (

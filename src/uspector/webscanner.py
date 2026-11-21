@@ -187,6 +187,7 @@ class WebScanner:
                     current_url,
                     error_prefix="Target",
                     resolver=socket.getaddrinfo,
+                    return_all=True,
                 )
                 pinned_ips[(host, port)] = dest_ip
 
@@ -464,6 +465,20 @@ class WebScanner:
                 "Password input served or submitted over unencrypted HTTP"
             )
 
+    @staticmethod
+    def _read_bounded_text(response, max_bytes: int = 65536) -> str:
+        buf = bytearray()
+        for chunk in response.iter_content(8192):
+            if not chunk:
+                continue
+            remaining = max_bytes - len(buf)
+            if remaining <= 0:
+                break
+            buf.extend(chunk[:remaining])
+            if len(buf) >= max_bytes:
+                break
+        return buf.decode("utf-8", errors="replace")
+
     def _check_metadata_endpoints(
         self,
         original_target: str,
@@ -479,9 +494,7 @@ class WebScanner:
         try:
             with self._open_response(f"{origin}/.well-known/security.txt") as (sec_resp, _):
                 if sec_resp.status_code == 200:
-                    sec_body = b"".join(sec_resp.iter_content(8192))[:65536].decode(
-                        "utf-8", errors="replace"
-                    )
+                    sec_body = self._read_bounded_text(sec_resp, 65536)
                     has_contact = bool(re.search(r"(?im)^Contact:", sec_body))
                     exp_match = re.search(r"(?im)^Expires:\s*(.+)$", sec_body)
                     metadata["security_txt"] = {
@@ -495,9 +508,7 @@ class WebScanner:
         try:
             with self._open_response(f"{origin}/robots.txt") as (rob_resp, _):
                 if rob_resp.status_code == 200:
-                    rob_body = b"".join(rob_resp.iter_content(8192))[:65536].decode(
-                        "utf-8", errors="replace"
-                    )
+                    rob_body = self._read_bounded_text(rob_resp, 65536)
                     disallows = re.findall(
                         r"(?im)^Disallow:\s*(\S+)",
                         rob_body,
@@ -571,10 +582,12 @@ class WebScanner:
                     result["resolved_ips"] = list(
                         dict.fromkeys(item[4][0] for item in addresses)
                     )
-                except socket.gaierror:
+                except socket.gaierror as exc:
                     result["findings"].append(
                         "DNS resolution failed"
                     )
+                    if not self.allow_private:
+                        raise ValueError("Unable to resolve Target hostname.") from exc
 
             # Ordinary GET request only; no attack payloads.
             with self._open_response(target) as (response, history):

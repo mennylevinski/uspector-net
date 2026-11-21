@@ -85,7 +85,12 @@ def validate_timeout(timeout):
     return float(timeout)
 
 
-def validate_public_http_url(url, error_prefix="Target", resolver=None):
+def validate_public_http_url(
+    url,
+    error_prefix="Target",
+    resolver=None,
+    return_all=False,
+):
     """Validate an HTTP(S) URL and verify all resolved IPs are globally routable."""
     parsed = urlparse(url)
     scheme = parsed.scheme.lower()
@@ -130,7 +135,11 @@ def validate_public_http_url(url, error_prefix="Target", resolver=None):
                 f"{error_prefix} resolves to a private or restricted IP address."
             )
 
-        validated_ips.append(ip.compressed)
+        if ip.compressed not in validated_ips:
+            validated_ips.append(ip.compressed)
+
+    if return_all:
+        return hostname.lower(), port, tuple(validated_ips)
 
     return hostname.lower(), port, validated_ips[0]
 
@@ -140,7 +149,26 @@ class PinnedIPAdapter(HTTPAdapter):
 
     def __init__(self, pinned_ips, *args, **kwargs):
         self._pinned_ips = pinned_ips
+        self._active_ip = {}
         super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def _is_ip_literal(host):
+        if not host:
+            return False
+        try:
+            ipaddress.ip_address(host.strip("[]"))
+            return True
+        except ValueError:
+            return False
+
+    def _get_candidates(self, key):
+        pinned = self._pinned_ips.get(key)
+        if not pinned:
+            return []
+        if isinstance(pinned, str):
+            return [pinned]
+        return [ip for ip in pinned if isinstance(ip, str) and ip]
 
     def send(
         self,
@@ -153,20 +181,46 @@ class PinnedIPAdapter(HTTPAdapter):
     ):
         parsed = urlparse(request.url)
         hostname = parsed.hostname
+        candidates = []
+        key = None
         if hostname:
             port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
-            pinned = self._pinned_ips.get((hostname.lower(), port))
-            if pinned and hostname.lower() != pinned.lower():
+            key = (hostname.lower(), port)
+            candidates = self._get_candidates(key)
+            if candidates and hostname.lower() != candidates[0].lower():
                 request.headers.setdefault("Host", parsed.netloc)
 
-        return super().send(
-            request,
-            stream=stream,
-            timeout=timeout,
-            verify=verify,
-            cert=cert,
-            proxies=proxies,
-        )
+        if len(candidates) <= 1:
+            return super().send(
+                request,
+                stream=stream,
+                timeout=timeout,
+                verify=verify,
+                cert=cert,
+                proxies=proxies,
+            )
+
+        last_exc = None
+        for candidate in candidates:
+            self._active_ip[key] = candidate
+            try:
+                response = super().send(
+                    request,
+                    stream=stream,
+                    timeout=timeout,
+                    verify=verify,
+                    cert=cert,
+                    proxies=proxies,
+                )
+                self._pinned_ips[key] = candidate
+                return response
+            except requests.exceptions.ConnectionError as exc:
+                last_exc = exc
+                continue
+            finally:
+                self._active_ip.pop(key, None)
+
+        raise last_exc
 
     def get_connection_with_tls_context(
         self,
@@ -184,10 +238,12 @@ class PinnedIPAdapter(HTTPAdapter):
         host = host_params["host"]
         port = host_params["port"]
         effective_port = port or (443 if host_params["scheme"] == "https" else 80)
-        pinned = self._pinned_ips.get((host.lower(), effective_port))
+        key = (host.lower(), effective_port)
+        candidates = self._get_candidates(key)
+        pinned = self._active_ip.get(key) or (candidates[0] if candidates else None)
 
         if pinned and host.lower() != pinned.lower():
-            if host_params["scheme"] == "https":
+            if host_params["scheme"] == "https" and not self._is_ip_literal(host):
                 pool_kwargs["server_hostname"] = host
                 pool_kwargs["assert_hostname"] = host
             host_params["host"] = pinned

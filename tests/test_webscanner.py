@@ -277,6 +277,31 @@ class TestWebScanner(unittest.TestCase):
         self.assertIn("robots.txt references potentially sensitive disallowed paths", result["findings"])
         self.assertIn("HTTP endpoint does not redirect to HTTPS", result["findings"])
 
+    def test_metadata_endpoints_stream_bounded_to_64kb_and_single_dns_fail_on_no_private(self):
+        chunks_read = 0
+
+        def infinite_chunks():
+            nonlocal chunks_read
+            while True:
+                chunks_read += 1
+                yield b"A" * 8192
+
+        resp = MagicMock()
+        resp.iter_content.side_effect = lambda _size: infinite_chunks()
+        text = WebScanner._read_bounded_text(resp, 65536)
+        self.assertEqual(len(text), 65536)
+        self.assertEqual(chunks_read, 8)
+
+        scanner = WebScanner(allow_private=False)
+        with patch(
+            "uspector.webscanner.socket.getaddrinfo",
+            side_effect=socket.gaierror("NXDOMAIN"),
+        ) as mock_dns:
+            res = scanner.scan("https://nonexistent.example")
+        self.assertEqual(mock_dns.call_count, 1)
+        self.assertIn("DNS resolution failed", res["findings"])
+        self.assertTrue(res["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

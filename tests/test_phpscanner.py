@@ -283,6 +283,57 @@ class TestPHPScanner(unittest.TestCase):
         self.assertIn("Composer Development Dependencies Exposed", titles)
         self.assertEqual(result["verdict"], "HIGH RISK")
 
+    def test_pinned_ip_adapter_multi_ip_failover_and_ipv6_literal_no_sni(self):
+        pinned_ips = {("example.com", 443): ("2001:db8::1", "93.184.216.34")}
+        adapter = PinnedIPAdapter(pinned_ips)
+        prepared = requests.Request("GET", "https://example.com/path").prepare()
+
+        ok_resp = MagicMock()
+        tried_hosts = []
+
+        def fake_super_send(req, **kwargs):
+            active = adapter._active_ip.get(("example.com", 443))
+            tried_hosts.append(active)
+            if active == "2001:db8::1":
+                raise requests.exceptions.ConnectionError("IPv6 unreachable")
+            return ok_resp
+
+        with patch.object(requests.adapters.HTTPAdapter, "send", side_effect=fake_super_send):
+            resp = adapter.send(prepared)
+
+        self.assertIs(resp, ok_resp)
+        self.assertEqual(tried_hosts, ["2001:db8::1", "93.184.216.34"])
+        self.assertEqual(pinned_ips[("example.com", 443)], "93.184.216.34")
+
+        # Uncompressed IPv6 literal URL should not set TLS SNI server_hostname
+        v6_adapter = PinnedIPAdapter({("2001:0db8::1", 443): "2001:db8::1"})
+        v6_adapter.poolmanager = MagicMock()
+        v6_req = requests.Request("GET", "https://[2001:0db8::1]/").prepare()
+        v6_adapter.get_connection_with_tls_context(v6_req, verify=True)
+        pool_kwargs = v6_adapter.poolmanager.connection_from_host.call_args.kwargs["pool_kwargs"]
+        self.assertNotIn("server_hostname", pool_kwargs)
+
+    def test_non_string_target_and_utf8_fallback_without_charset_header(self):
+        scanner = PHPScanner()
+        res_none = scanner.scan(None)
+        self.assertEqual(res_none["verdict"], "SCAN FAILED")
+        self.assertNotIn("Unexpected scan error", res_none["error"])
+
+        resp = self._mock_http_response(
+            status_code=200,
+            headers={"Content-Type": "text/html"},
+            body="Café".encode("utf-8"),
+        )
+        resp.encoding = "ISO-8859-1"
+        session = MagicMock()
+        session.get.return_value = resp
+        with patch(
+            "uspector.phpscanner.socket.getaddrinfo",
+            return_value=[(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 443))],
+        ):
+            data = scanner._request(session, "https://example.com/")
+        self.assertEqual(data["body"], "Café")
+
 
 if __name__ == "__main__":
     unittest.main()

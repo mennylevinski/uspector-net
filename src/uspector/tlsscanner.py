@@ -168,11 +168,12 @@ class TLSScanner:
             return False
 
     @staticmethod
-    def _validate_public_http_url(url):
+    def _validate_public_http_url(url, return_all=False):
         return validate_public_http_url(
             url,
             error_prefix="AIA URL",
             resolver=socket.getaddrinfo,
+            return_all=return_all,
         )
 
     def _fetch_public_http_bytes(
@@ -193,7 +194,10 @@ class TLSScanner:
             session.mount("https://", adapter)
 
             for _ in range(4):
-                host, port, dest_ip = self._validate_public_http_url(current_url)
+                host, port, dest_ip = self._validate_public_http_url(
+                    current_url,
+                    return_all=True,
+                )
                 pinned_ips[(host, port)] = dest_ip
 
                 response = session.request(
@@ -327,6 +331,27 @@ class TLSScanner:
         """Validate OCSP CertID, freshness, and cryptographic signature."""
         now = datetime.now(timezone.utc)
         serial_matches = ocsp_response.serial_number == certificate.serial_number
+        if serial_matches:
+            resp_in_hash = getattr(ocsp_response, "issuer_name_hash", None)
+            resp_ik_hash = getattr(ocsp_response, "issuer_key_hash", None)
+            resp_hash_alg = getattr(ocsp_response, "hash_algorithm", None)
+            if (
+                isinstance(resp_in_hash, (bytes, bytearray))
+                and isinstance(resp_ik_hash, (bytes, bytearray))
+                and isinstance(resp_hash_alg, hashes.HashAlgorithm)
+            ):
+                try:
+                    expected_req = (
+                        ocsp.OCSPRequestBuilder()
+                        .add_certificate(certificate, issuer, resp_hash_alg)
+                        .build()
+                    )
+                    serial_matches = (
+                        bytes(resp_in_hash) == expected_req.issuer_name_hash
+                        and bytes(resp_ik_hash) == expected_req.issuer_key_hash
+                    )
+                except Exception:
+                    serial_matches = False
 
         this_update = getattr(ocsp_response, "this_update_utc", None)
         next_update = getattr(ocsp_response, "next_update_utc", None)
@@ -343,20 +368,16 @@ class TLSScanner:
 
         if responder_certs:
             for candidate in responder_certs:
-                spki_bytes = candidate.public_key().public_bytes(
-                    serialization.Encoding.DER,
-                    serialization.PublicFormat.SubjectPublicKeyInfo,
-                )
-                # RFC 6960 responderKeyHash is SHA-1 of BIT STRING contents;
-                # also match subject name if present.
                 name_match = resp_name is not None and candidate.subject == resp_name
-                key_match = resp_key_hash is not None and (
-                    hashlib.sha1(spki_bytes).digest() == resp_key_hash
-                    or any(
-                        hashlib.sha1(spki_bytes[idx:]).digest() == resp_key_hash
-                        for idx in range(min(32, len(spki_bytes)))
-                    )
-                )
+                key_match = False
+                if resp_key_hash is not None:
+                    try:
+                        candidate_ski = x509.SubjectKeyIdentifier.from_public_key(
+                            candidate.public_key()
+                        ).digest
+                        key_match = candidate_ski == resp_key_hash
+                    except Exception:
+                        key_match = False
                 if not (name_match or key_match):
                     continue
 
@@ -606,10 +627,12 @@ class TLSScanner:
                 break
         return buf.decode("ascii", errors="replace")
 
+    MAX_STARTTLS_LINES = 64
+
     @classmethod
     def _read_smtp_reply(cls, sock):
         lines = []
-        while True:
+        for _ in range(cls.MAX_STARTTLS_LINES):
             line = cls._recv_line(sock)
             if not line:
                 break
@@ -618,6 +641,8 @@ class TLSScanner:
                 break
             if len(line) < 4:
                 break
+        else:
+            raise OSError("STARTTLS server sent too many continuation lines")
         return "".join(lines)
 
     @classmethod
@@ -640,8 +665,16 @@ class TLSScanner:
             if "OK" not in banner.upper():
                 raise OSError("Unexpected IMAP banner before STARTTLS")
             raw_sock.sendall(b"a001 STARTTLS\r\n")
-            reply = cls._recv_line(raw_sock)
-            if "a001 OK" not in reply.upper():
+            tagged_ok = False
+            for _ in range(cls.MAX_STARTTLS_LINES):
+                reply = cls._recv_line(raw_sock)
+                if not reply:
+                    break
+                upper_reply = reply.lstrip().upper()
+                if upper_reply.startswith("A001 "):
+                    tagged_ok = upper_reply.startswith("A001 OK")
+                    break
+            if not tagged_ok:
                 raise OSError("IMAP server rejected STARTTLS")
         elif proto == "ftp":
             banner = cls._read_smtp_reply(raw_sock)

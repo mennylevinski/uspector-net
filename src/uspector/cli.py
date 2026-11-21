@@ -54,6 +54,18 @@ def main():
         help="Skip DNSSEC inspection.",
     )
     dns_parser.add_argument(
+        "--no-extended",
+        action="store_true",
+        help="Skip extended DNS checks (MTA-STS, TLS-RPT, BIMI, dangling CNAME).",
+    )
+    dns_parser.add_argument(
+        "-t",
+        "--timeout",
+        type=float,
+        default=None,
+        help="DNS query timeout in seconds (default: 2).",
+    )
+    dns_parser.add_argument(
         "--json",
         action="store_true",
         help="Output the complete result as JSON.",
@@ -82,6 +94,17 @@ def main():
         type=float,
         default=5.0,
         help="Connection timeout in seconds (default: 5).",
+    )
+    tls_parser.add_argument(
+        "--starttls",
+        choices=("smtp", "imap", "ftp"),
+        default=None,
+        help="Negotiate STARTTLS before TLS handshake (smtp, imap, ftp).",
+    )
+    tls_parser.add_argument(
+        "--probe-weak-ciphers",
+        action="store_true",
+        help="Opt-in active probing for legacy/weak cipher suites.",
     )
     tls_parser.add_argument(
         "--json",
@@ -130,6 +153,16 @@ def main():
         help="HTTP timeout in seconds (default: 15).",
     )
     web_parser.add_argument(
+        "--no-private",
+        action="store_true",
+        help="Block private, loopback, and non-global destination IPs.",
+    )
+    web_parser.add_argument(
+        "--check-metadata",
+        action="store_true",
+        help="Inspect security.txt, robots.txt, and HTTP-to-HTTPS redirect.",
+    )
+    web_parser.add_argument(
         "--json",
         action="store_true",
         help="Output the complete result as JSON.",
@@ -139,19 +172,37 @@ def main():
 
     try:
         if args.command == "dns":
-            scanner = DNSScanner()
+            dns_init_kwargs = {}
+            if args.timeout is not None:
+                dns_init_kwargs["timeout"] = args.timeout
+            scanner = DNSScanner(**dns_init_kwargs)
+            dns_scan_kwargs = {
+                "dkim_selector": args.dkim_selector,
+                "include_dnssec": not args.no_dnssec,
+            }
+            if args.no_extended:
+                dns_scan_kwargs["check_extended"] = False
             result = scanner.scan(
                 args.hostname,
-                dkim_selector=args.dkim_selector,
-                include_dnssec=not args.no_dnssec,
+                **dns_scan_kwargs,
             )
 
         elif args.command == "tls":
             scanner = TLSScanner(timeout=args.timeout)
-            result = scanner.check_tls(args.hostname, args.port)
+            tls_kwargs = {}
+            if args.starttls is not None:
+                tls_kwargs["starttls"] = args.starttls
+            if args.probe_weak_ciphers:
+                tls_kwargs["probe_weak_ciphers"] = True
+            result = scanner.check_tls(args.hostname, args.port, **tls_kwargs)
 
         elif args.command == "web":
-            scanner = WebScanner(timeout=args.timeout)
+            web_init_kwargs = {"timeout": args.timeout}
+            if args.no_private:
+                web_init_kwargs["allow_private"] = False
+            if args.check_metadata:
+                web_init_kwargs["check_metadata"] = True
+            scanner = WebScanner(**web_init_kwargs)
             result = scanner.scan(args.target)
 
         elif args.command == "php":

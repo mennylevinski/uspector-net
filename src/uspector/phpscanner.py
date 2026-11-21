@@ -90,6 +90,9 @@ class PHPScanner:
     @staticmethod
     def _normalize_url(target):
 
+        if not isinstance(target, str):
+            raise ValueError("Target must be a non-empty string.")
+
         target = target.strip()
 
         if not target:
@@ -125,11 +128,12 @@ class PHPScanner:
         ))
 
     @staticmethod
-    def _validate_destination(url):
+    def _validate_destination(url, return_all=False):
         return validate_public_http_url(
             url,
             error_prefix="Target",
             resolver=socket.getaddrinfo,
+            return_all=return_all,
         )
 
     # --------------------------------------------------
@@ -142,7 +146,13 @@ class PHPScanner:
 
         for _ in range(self.MAX_REDIRECTS + 1):
 
-            validated = self._validate_destination(current_url)
+            try:
+                validated = self._validate_destination(
+                    current_url,
+                    return_all=True,
+                )
+            except TypeError:
+                validated = self._validate_destination(current_url)
             if (
                 pinned_ips is not None
                 and isinstance(validated, tuple)
@@ -188,8 +198,20 @@ class PHPScanner:
                     if len(content) >= self.MAX_RESPONSE_SIZE:
                         break
 
+                content_type = response.headers.get("Content-Type", "")
+                encoding = response.encoding
+                if (
+                    not encoding
+                    or (
+                        isinstance(encoding, str)
+                        and encoding.lower() in ("iso-8859-1", "latin-1", "latin1")
+                        and "charset=" not in content_type.lower()
+                    )
+                ):
+                    encoding = "utf-8"
+
                 body = content.decode(
-                    response.encoding or "utf-8",
+                    encoding,
                     errors="replace",
                 )
 
@@ -199,9 +221,7 @@ class PHPScanner:
                     "headers": CaseInsensitiveDict(response.headers),
                     "set_cookie_headers": extract_set_cookie_headers(response),
                     "body": body,
-                    "content_type": response.headers.get(
-                        "Content-Type", ""
-                    ),
+                    "content_type": content_type,
                 }
 
             finally:

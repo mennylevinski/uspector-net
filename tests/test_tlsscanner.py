@@ -417,6 +417,106 @@ class TestTLSScanner(unittest.TestCase):
         self.assertIn(b"EHLO uspector.local\r\n", sent)
         self.assertIn(b"STARTTLS\r\n", sent)
 
+    def test_starttls_imap_untagged_and_smtp_line_limit(self):
+        imap_sock = MagicMock()
+        imap_Transcript = (
+            b"* OK IMAP4rev1 Service Ready\r\n"
+            b"* CAPABILITY IMAP4rev1 STARTTLS\r\n"
+            b"a001 OK Begin TLS negotiation now\r\n"
+        )
+        imap_sock.recv.side_effect = [bytes([b]) for b in imap_Transcript]
+        TLSScanner._negotiate_starttls(imap_sock, "imap")
+
+        runaway_sock = MagicMock()
+        with patch.object(TLSScanner, "_recv_line", return_value="250-CONT\r\n"):
+            with self.assertRaises(OSError):
+                TLSScanner._read_smtp_reply(runaway_sock)
+
+    def test_ocsp_rejects_mismatched_issuer_hash_and_accepts_delegated_responder_ski(self):
+        ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        issuer_cert, _ = self._build_cert(common_name="Test CA", key=ca_key)
+        other_ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        other_ca_cert, _ = self._build_cert(common_name="Other CA", key=other_ca_key)
+        leaf_cert, _ = self._build_cert(
+            common_name="example.com",
+            issuer_name=issuer_cert.subject,
+            aia_ocsp="http://ocsp.example.test/ocsp",
+            key=ca_key,
+        )
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        # Response with matching leaf serial but built against wrong issuer CertID
+        wrong_issuer_ocsp = (
+            ocsp.OCSPResponseBuilder()
+            .add_response(
+                cert=leaf_cert,
+                issuer=other_ca_cert,
+                algorithm=hashes.SHA1(),
+                cert_status=ocsp.OCSPCertStatus.GOOD,
+                this_update=now - datetime.timedelta(minutes=5),
+                next_update=now + datetime.timedelta(hours=12),
+                revocation_time=None,
+                revocation_reason=None,
+            )
+            .responder_id(ocsp.OCSPResponderEncoding.HASH, issuer_cert)
+            .sign(ca_key, hashes.SHA256())
+        )
+        scanner = TLSScanner()
+        with patch.object(
+            scanner,
+            "_fetch_public_http_bytes",
+            return_value=wrong_issuer_ocsp.public_bytes(serialization.Encoding.DER),
+        ):
+            res_mismatch = scanner._check_ocsp(
+                leaf_cert,
+                [leaf_cert, issuer_cert],
+                certificate_trusted=True,
+            )
+        self.assertEqual(res_mismatch["status"], "Serial Mismatch")
+        self.assertFalse(res_mismatch["response_validated"])
+
+        # Delegated responder signed by CA with OCSP_SIGNING EKU and HASH ResponderID
+        resp_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        responder_cert = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "OCSP Responder")]))
+            .issuer_name(issuer_cert.subject)
+            .public_key(resp_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=30))
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.OCSP_SIGNING]), critical=False)
+            .sign(ca_key, hashes.SHA256())
+        )
+        delegated_ocsp = (
+            ocsp.OCSPResponseBuilder()
+            .add_response(
+                cert=leaf_cert,
+                issuer=issuer_cert,
+                algorithm=hashes.SHA1(),
+                cert_status=ocsp.OCSPCertStatus.GOOD,
+                this_update=now - datetime.timedelta(minutes=5),
+                next_update=now + datetime.timedelta(hours=12),
+                revocation_time=None,
+                revocation_reason=None,
+            )
+            .responder_id(ocsp.OCSPResponderEncoding.HASH, responder_cert)
+            .certificates([responder_cert])
+            .sign(resp_key, hashes.SHA256())
+        )
+        with patch.object(
+            scanner,
+            "_fetch_public_http_bytes",
+            return_value=delegated_ocsp.public_bytes(serialization.Encoding.DER),
+        ):
+            res_delegated = scanner._check_ocsp(
+                leaf_cert,
+                [leaf_cert, issuer_cert],
+                certificate_trusted=True,
+            )
+        self.assertEqual(res_delegated["status"], "GOOD")
+        self.assertTrue(res_delegated["response_validated"])
+
 # --- Output ---
 if __name__ == "__main__":
     unittest.main()

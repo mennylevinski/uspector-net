@@ -122,6 +122,24 @@ class TestDNSScanner(unittest.TestCase):
 
         self.assertEqual(packet, valid_resp)
         self.assertEqual(mock_sock.recvfrom.call_count, 3)
+        mock_sock.sendto.assert_called_once()
+
+    def test_init_parameter_validation(self):
+        for bad_timeout in (0, -1, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                DNSScanner(timeout=bad_timeout)
+        for bad_type in ("2", True, None):
+            with self.assertRaises(TypeError):
+                DNSScanner(timeout=bad_type)
+        with self.assertRaises(ValueError):
+            DNSScanner(retries=0)
+        with self.assertRaises(TypeError):
+            DNSScanner(retries=True)
+        for bad_port in (0, 65536, -5):
+            with self.assertRaises(ValueError):
+                DNSScanner(port=bad_port)
+        with self.assertRaises(TypeError):
+            DNSScanner(port=False)
 
     def test_scan_deduplicates_cname_and_tightens_email_checks(self):
         cname_rec = {"name": "sub.example.com", "type": "CNAME", "value": "target.example.com"}
