@@ -1,6 +1,6 @@
 # Uspector Technical Overview
 
-This document describes the architecture, module structure, execution flows, security controls, and output contracts of **Uspector** (`1.1.1`).
+This document describes the architecture, module structure, execution flows, security controls, and output contracts of **Uspector** (`1.1.2`).
 
 ---
 
@@ -13,7 +13,7 @@ uspector-net/
 ├── img/
 │   └── uspector-main-logo-prod.png
 ├── src/uspector/
-│   ├── __init__.py           # Public exports & __version__ ("1.1.1")
+│   ├── __init__.py           # Public exports & __version__ ("1.1.2")
 │   ├── _http.py              # Shared timeout, SSRF/DNS-pinning, and cookie-parsing helpers
 │   ├── cli.py                # argparse CLI entrypoint (uspector) and exit-code mapping
 │   ├── dnsscanner.py         # Standard-library DNS wire client and DNS/email/DNSSEC checks
@@ -77,14 +77,14 @@ Each scanner exposes:
 ## 3. Shared HTTP & Security Primitives (`src/uspector/_http.py`)
 
 - **`validate_timeout(timeout)`**: Rejects `bool`, non-numeric types (`TypeError`), and non-finite or `<= 0` numbers (`ValueError`).
-- **`validate_public_http_url(url, error_prefix="Target", resolver=None)`**:
+- **`validate_public_http_url(url, error_prefix="Target", resolver=None, return_all=False)`**:
   - Enforces `http` / `https` schemes, non-empty hostnames, absence of URL credentials, valid port bounds (`1..65535`), and non-`localhost` hostnames.
   - Resolves via `socket.getaddrinfo(..., type=socket.SOCK_STREAM)` and requires every returned IP address to satisfy `ipaddress.ip_address(...).is_global`.
-  - Returns `(hostname.lower(), port, validated_ip)`.
+  - Returns `(hostname.lower(), port, validated_ip)` by default, or `(hostname.lower(), port, tuple(validated_ips))` when `return_all=True`.
 - **`PinnedIPAdapter(HTTPAdapter)`**:
-  - Prevents DNS-rebinding TOCTOU between validation and connection by pinning `(host, effective_port) -> validated_ip`.
-  - `send()` preserves the original `Host` header (`parsed.netloc`) when connecting to a pinned IP.
-  - `get_connection_with_tls_context()` rewrites `host_params["host"]` to the pinned IP while setting `pool_kwargs["server_hostname"]` and `pool_kwargs["assert_hostname"]` to the original hostname for HTTPS SNI and certificate verification.
+  - Prevents DNS-rebinding TOCTOU between validation and connection by pinning `(host, effective_port)` to a validated IP or tuple of validated IPs.
+  - `send()` preserves the original `Host` header (`parsed.netloc`) when connecting to a pinned IP and fails over across candidate validated IPs on `requests.exceptions.ConnectionError`.
+  - `get_connection_with_tls_context()` rewrites `host_params["host"]` to the pinned IP while setting `pool_kwargs["server_hostname"]` and `pool_kwargs["assert_hostname"]` to the original hostname for HTTPS SNI and certificate verification (skipping SNI override when `host` is an IP literal).
 - **`extract_set_cookie_headers(response)` & `parse_cookie_attributes(cookie_header)`**:
   - Prefers `response.raw.headers.getlist("Set-Cookie")` and falls back to a cookie-token-aware regex split on comma-joined `Set-Cookie` headers so `Expires=` dates containing commas are not split.
   - Parses `Secure`, `HttpOnly`, and validates `SameSite` (`lax`, `strict`, or `none` paired with `secure`).
@@ -116,7 +116,7 @@ Each scanner exposes:
   - `_check_certificate_validity()`: checks `not_valid_before_utc`, `not_valid_after_utc`, and `<= 30` days remaining.
   - `_check_certificate_hygiene()`: flags `MD5`/`SHA1` signatures, `> 398`-day leaf validity on trusted certs, `BasicConstraints(ca=True)` on leaf certs, missing `serverAuth` EKU, and extracts `has_sct` and `crl_urls`.
   - `_check_certificate_chain_quality()`: checks missing intermediates when `SSLSocket.get_unverified_chain` is present (Python 3.13+) and audits intermediate expiry, weak signatures, and `< 2048`-bit RSA keys.
-  - `_check_ocsp()`: checks AIA `OCSP` and `CA_ISSUERS` URLs via `_fetch_public_http_bytes()` (enforcing `validate_public_http_url` + `PinnedIPAdapter` SSRF guards and max 1 MB reads), then `_validate_ocsp_response()` verifies CertID serial match, `this_update`/`next_update` freshness, and cryptographic signature (direct issuer or delegated `OCSP_SIGNING` responder). Sets `response_validated=True` only when all checks and `certificate_trusted` pass.
+  - `_check_ocsp()`: checks AIA `OCSP` and `CA_ISSUERS` URLs via `_fetch_public_http_bytes()` (enforcing `validate_public_http_url` + `PinnedIPAdapter` SSRF guards and max 1 MB reads), then `_validate_ocsp_response()` verifies `CertID` (`serial_number`, `issuer_name_hash`, and `issuer_key_hash`), `this_update`/`next_update` freshness, and cryptographic signature (direct issuer or delegated `OCSP_SIGNING` responder matched by subject or `SubjectKeyIdentifier` key hash). Sets `response_validated=True` only when all checks and `certificate_trusted` pass.
 - **Protocol & Cipher Probing**:
   - `_check_tls_protocol_support()` probes `TLSv1.0`–`TLSv1.3` across resolved IPs, flags deprecated protocols, weak negotiated ciphers (`RC4`, `3DES`, `DES`, `NULL`, `EXPORT`, `ANON`, `ADH`, `AECDH`, `MD5`, `RC2`, `< 128` bits), and TLS `<= 1.2` suites lacking forward secrecy (`ECDHE`/`DHE`).
   - When `probe_weak_ciphers=True`, `_probe_weak_ciphers()` probes TLS 1.2 acceptance of weak cipher classes.
@@ -146,6 +146,11 @@ Each scanner exposes:
 ## 5. CLI & Exit-Code Contract (`src/uspector/cli.py`)
 
 `main()` exposes four subcommands (`dns`, `tls`, `web`, `php`) plus `--version`:
+- Subcommand options:
+  - `dns`: `--dkim-selector`, `--no-dnssec`, `--no-extended`, `-t/--timeout`, `--json`
+  - `tls`: `-p/--port`, `-t/--timeout`, `--starttls {smtp,imap,ftp}`, `--probe-weak-ciphers`, `--json`
+  - `web`: `-t/--timeout`, `--no-private`, `--check-metadata`, `--json`
+  - `php`: `-t/--timeout`, `--json`
 - Output is either `json.dumps(result, indent=2, default=str)` (`--json`) or `scanner.format_scan(result)`.
 - Exit codes:
   - `0`: Scan succeeded (findings may still be present in the report).
@@ -157,5 +162,5 @@ Each scanner exposes:
 
 ## 6. Testing & Release CI
 
-- **Tests (`tests/`)**: All 67 tests use `unittest` and `unittest.mock` so the suite runs completely offline (`PYTHONPATH=src python -B -m unittest discover -s tests -v`).
+- **Tests (`tests/`)**: All 74 tests use `unittest` and `unittest.mock` so the suite runs completely offline (`PYTHONPATH=src python -B -m unittest discover -s tests -v`).
 - **CI (`.github/workflows/linux-release.yml`)**: Triggered on `workflow_dispatch` and `v*` tags; installs the package, runs `unittest`, builds a one-file Linux binary with PyInstaller (`dist/linux/uspector`), and runs `--version` / `--help` smoke checks across all four subcommands.

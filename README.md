@@ -44,10 +44,11 @@ Scan a domain:
 uspector dns example.com
 ```
 
-Check a DKIM selector or skip DNSSEC record lookups:
+Check a DKIM selector, set a custom query timeout, or skip DNSSEC / extended record lookups:
 
 ```bash
 uspector dns example.com --dkim-selector default --no-dnssec
+uspector dns example.com -t 4 --no-extended
 ```
 
 The DNS scanner inspects common DNS records (`A`, `AAAA`, `CNAME`, `MX`, `NS`, `TXT`, `CAA`, and `SOA`), evaluates SPF/DMARC/DKIM/CAA/NS/SOA hygiene, detects Null MX (`0 .`), and inspects DNSSEC-related records (`DS`, `DNSKEY`, `RRSIG`).
@@ -62,10 +63,11 @@ Scan a hostname:
 uspector tls example.com
 ```
 
-Specify a custom port or connection timeout:
+Specify a custom port, connection timeout, `STARTTLS` protocol (`smtp`, `imap`, `ftp`), or weak-cipher probing:
 
 ```bash
 uspector tls example.com -p 8443 -t 10
+uspector tls example.com -p 587 --starttls smtp --probe-weak-ciphers
 ```
 
 Use this to inspect TLS connectivity, certificate properties, hostname/SAN validation, certificate expiration and hygiene, intermediate chain quality, OCSP status/validation, supported TLS versions (`TLSv1.0`–`TLSv1.3`), cipher suites, and connection diagnostics.
@@ -78,10 +80,11 @@ Scan a website:
 uspector web example.com
 ```
 
-Specify a complete URL and custom timeout when needed:
+Specify a complete URL, custom timeout, private-IP blocking (`--no-private`), or metadata checks (`--check-metadata`):
 
 ```bash
 uspector web https://example.com -t 10
+uspector web https://example.com --no-private --check-metadata
 ```
 
 The web scanner follows HTTP redirects and reports the final URL, HTTP status, resolved IP addresses, security headers and directive quality, cookie attributes across redirects, passive client-side/HTML/body security indicators, and on-page SEO diagnostics.
