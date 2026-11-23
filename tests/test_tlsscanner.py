@@ -196,6 +196,28 @@ class TestTLSScanner(unittest.TestCase):
         self.assertIn("TLS certificate is self-signed and not trusted", result["findings"])
         self.assertNotIn("Certificate subject and issuer are identical", result["findings"])
 
+        # Clean trusted handshake should return verdict "VALID"
+        ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Trusted CA")])
+        valid_leaf, _ = self._build_cert(
+            common_name="example.com",
+            san_dns=["example.com"],
+            issuer_name=ca_name,
+            key=ca_key,
+        )
+        valid_inspected = dict(inspected, certificate_obj=valid_leaf, certificate_chain=[valid_leaf])
+        with (
+            patch(
+                "uspector.tlsscanner.socket.getaddrinfo",
+                return_value=[(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 443))],
+            ),
+            patch.object(scanner, "_inspect_connection", return_value=valid_inspected),
+            patch.object(scanner, "_check_ocsp", return_value={"status": "URL Not Available", "url": None, "response_validated": False}),
+            patch.object(scanner, "_check_tls_protocol_support", return_value=["TLSv1.3"]),
+        ):
+            valid_result = scanner.check_tls("example.com")
+        self.assertEqual(valid_result["verdict"], "VALID")
+
     def test_ip_literal_omits_sni_server_hostname(self):
         cert, _ = self._build_cert(common_name="1.1.1.1", san_ips=["1.1.1.1"])
         cert_der = cert.public_bytes(serialization.Encoding.DER)

@@ -120,7 +120,7 @@ Each scanner exposes:
 - **Protocol & Cipher Probing**:
   - `_check_tls_protocol_support()` probes `TLSv1.0`–`TLSv1.3` across resolved IPs, flags deprecated protocols, weak negotiated ciphers (`RC4`, `3DES`, `DES`, `NULL`, `EXPORT`, `ANON`, `ADH`, `AECDH`, `MD5`, `RC2`, `< 128` bits), and TLS `<= 1.2` suites lacking forward secrecy (`ECDHE`/`DHE`).
   - When `probe_weak_ciphers=True`, `_probe_weak_ciphers()` probes TLS 1.2 acceptance of weak cipher classes.
-- **Verdict Model**: `"SECURE"`, `"WARNING"`, or `"INCONCLUSIVE"`.
+- **Verdict Model**: `"VALID"`, `"WARNING"`, or `"INCONCLUSIVE"`.
 
 ### 4.3 `WebScanner` (`src/uspector/webscanner.py`)
 - **Transport & SSRF Control (`WebScanner(timeout=15.0, allow_private=True, check_metadata=False)`)**:

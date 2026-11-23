@@ -6,7 +6,7 @@ from .webscanner import WebScanner
 from .phpscanner import PHPScanner
 
 
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 
 __all__ = [
     "DNSScanner",

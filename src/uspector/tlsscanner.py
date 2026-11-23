@@ -1448,7 +1448,7 @@ class TLSScanner:
             ):
                 result["verdict"] = "WARNING"
             else:
-                result["verdict"] = "SECURE"
+                result["verdict"] = "VALID"
 
         elif result["diagnostic_handshake"] == "Passed":
             if (
